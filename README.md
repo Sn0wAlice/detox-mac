@@ -1,5 +1,7 @@
 # detox-mac
 
+![](./.github/banner.png)
+
 > A fast, cute and clean Rust-based macOS maintenance CLI tool.  
 > Think of it as *CleanMyMac*, but open-source, modular, and no BS. 🦀
 
