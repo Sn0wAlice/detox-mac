@@ -26,6 +26,7 @@
 git clone https://github.com/youruser/detox-mac.git
 cd detox-mac
 cargo build --release
+cp target/release/detox-mac /usr/local/bin/detox-mac
 ```
 
 You’ll find the binary at target/release/detox-mac
