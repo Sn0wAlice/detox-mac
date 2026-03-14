@@ -1,5 +1,12 @@
 pub mod cache;
-pub mod trash;
+pub mod dsstore;
+pub mod homebrew;
 pub mod launch;
-pub mod system;
 pub mod login;
+pub mod logs;
+pub mod scanner;
+pub mod sysinfo;
+pub mod system;
+pub mod trash;
+pub mod utils;
+pub mod xcode;

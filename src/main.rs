@@ -1,45 +1,68 @@
-mod cli;
+mod app;
 mod modules;
+mod ui;
 
-use clap::Parser;
-use cli::{Cli, Commands};
-use modules::{cache, launch, trash, system, login};
+use std::io;
 
-fn main() {
-    let args = Cli::parse();
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use ratatui::prelude::*;
 
-    match args.command {
-        Commands::CleanCache => cache::clean_cache(),
-        Commands::CleanTrash => trash::clean_trash(),
-        Commands::RemoveLaunchItems => launch::remove_launch_items(),
-        Commands::CleanAll { skip_confirmation } => {
-            if skip_confirmation || confirm_clean_all() {
-                cache::clean_cache();
-                trash::clean_trash();
-                launch::remove_launch_items();
-                println!("✅ All cleaning tasks completed successfully!");
-            } else {
-                println!("❌ Cleaning aborted by user.");
-            }
-        }
-        Commands::FlushDns => system::flush_dns(),
-        Commands::FreeSpace => system::free_purgeable_space(),
-        Commands::ReindexSpotlight => system::reindex_spotlight(),
-        Commands::RepairPermissions => system::repair_disk_permissions(),
-        Commands::ListLoginItems => login::list_login_items(),
-        Commands::RemoveLoginItem { name } => login::remove_login_item(&name),
+fn main() -> io::Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    let mut app = app::App::new();
+    let res = run_app(&mut terminal, &mut app);
+
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
+
+    if let Err(err) = res {
+        eprintln!("Erreur: {}", err);
     }
+
+    Ok(())
 }
 
-fn confirm_clean_all() -> bool {
-    use std::io::{self, Write};
+fn run_app(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut app::App,
+) -> io::Result<()> {
+    loop {
+        terminal.draw(|f| ui::draw(f, app))?;
 
-    print!("Are you sure you want to clean all caches, trash, and launch items? (yes/no): ");
-    io::stdout().flush().unwrap(); // Ensure prompt is displayed before reading input
-
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).unwrap();
-    let input = input.trim().to_lowercase();
-
-    input == "yes" || input == "y"
+        if let Event::Key(key) = event::read()? {
+            if key.kind == KeyEventKind::Press {
+                match key.code {
+                    KeyCode::Char('q') => return Ok(()),
+                    KeyCode::Esc => {
+                        if app.confirming {
+                            app.cancel_confirm();
+                        } else {
+                            return Ok(());
+                        }
+                    }
+                    KeyCode::Tab | KeyCode::Right => app.next_tab(),
+                    KeyCode::BackTab | KeyCode::Left => app.prev_tab(),
+                    KeyCode::Up | KeyCode::Char('k') => app.prev_task(),
+                    KeyCode::Down | KeyCode::Char('j') => app.next_task(),
+                    KeyCode::Enter => app.execute_current_task(),
+                    KeyCode::Char(' ') => app.toggle_task(),
+                    KeyCode::Char('r') => app.run_selected(),
+                    KeyCode::Char('d') => app.toggle_dry_run(),
+                    KeyCode::PageUp => app.scroll_log_up(),
+                    KeyCode::PageDown => app.scroll_log_down(),
+                    _ => {}
+                }
+            }
+        }
+    }
 }
