@@ -161,6 +161,40 @@ pub enum Command {
         depth: usize,
     },
 
+    /// Inspecter la mémoire vive, regroupée par application.
+    Ram {
+        /// Nombre de groupes affichés (0 = tous).
+        #[arg(short, long, value_name = "N", default_value_t = 15)]
+        top: usize,
+
+        /// Inclure les processus de macOS et des applications Apple.
+        #[arg(short, long)]
+        all: bool,
+
+        /// Détailler les processus de chaque groupe.
+        #[arg(short, long)]
+        detail: bool,
+
+        /// Masquer les groupes en dessous de cette taille.
+        #[arg(short, long, value_name = "TAILLE", default_value = "0", value_parser = format::parse_size)]
+        min: u64,
+    },
+
+    /// Arrêter tous les processus d'une application.
+    Kill {
+        /// Nom de l'application, ou numéro affiché par `detox-mac ram`.
+        #[arg(value_name = "CIBLE", required = true, num_args = 1..)]
+        target: Vec<String>,
+
+        /// Envoyer SIGKILL au lieu de SIGTERM (arrêt brutal, sans sauvegarde).
+        #[arg(short, long)]
+        force: bool,
+
+        /// Autoriser à viser un composant de macOS ou une application Apple.
+        #[arg(long)]
+        system: bool,
+    },
+
     /// Gérer les agents et démons de démarrage.
     Agents {
         #[command(subcommand)]

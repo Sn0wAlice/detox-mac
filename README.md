@@ -7,6 +7,8 @@
 
 ```bash
 detox-mac info          # ce que contient la machine, et ce qui est récupérable
+detox-mac ram           # qui mange la RAM, groupé par application
+detox-mac kill discord  # et on coupe tout Discord d'un coup
 detox-mac clean all -n  # ce qui serait supprimé, sans rien toucher
 detox-mac clean all     # on y va
 ```
@@ -20,6 +22,8 @@ detox-mac clean all     # on y va
 | `info` | Résumé machine (macOS, CPU, RAM, disque, uptime) + espace récupérable + agents de démarrage |
 | `scan [CIBLE…]` | Mesure l'espace récupérable, **sans jamais rien supprimer** |
 | `clean <CIBLE…>` | Nettoie une ou plusieurs cibles (`all` pour tout) |
+| `ram` | Processus regroupés par application mère, triés par mémoire |
+| `kill <cible>` | Arrête tous les processus d'une application (nom ou numéro) |
 | `apps` | Applications installées, de la plus lourde à la plus légère |
 | `files` | Fichiers volumineux du dossier personnel |
 | `agents list\|disable\|enable\|remove` | Agents et démons de démarrage (`launchd`) |
@@ -43,6 +47,67 @@ detox-mac clean all     # on y va
 
 Docker n'est nettoyé que s'il est installé **et** que le démon répond ; sinon la
 cible est simplement ignorée. Idem pour Homebrew et Xcode.
+
+---
+
+## 🧠 Inspecter la mémoire
+
+`detox-mac ram` fait ce que fait le Moniteur d'activité, en plus lisible : il
+regroupe les processus **par application mère**, pour qu'un Electron avec ses
+quinze helpers compte pour une seule ligne.
+
+```bash
+detox-mac ram                      # top 15 des applications hors macOS
+detox-mac ram --detail             # avec le détail des processus
+detox-mac ram --all                # inclut macOS et les applications Apple
+detox-mac ram --min 100M --top 0   # tout ce qui dépasse 100 Mo
+```
+
+```
+Mémoire
+  Physique         16.00 Go — 9.64 Go utilisée, 358.6 Mo libre, 5.37 Go inactive
+  Swap             2.44 Go utilisé sur 4.00 Go
+  Pression         71 % de mémoire libre
+
+Processus hors macOS (21 groupe(s) — 7.36 Go)
+    1.    1.64 Go  Visual Studio Code                 14 proc.
+    2.    1.60 Go  Claude                             27 proc.
+    3.   796.0 Mo  Spotify                            6 proc.
+    4.    92.0 Mo  Little Snitch                      démarrage auto · 1 proc.
+    5.    19.0 Mo  WiFiman Desktop                    démarrage auto · 1 proc.
+```
+
+- Un processus sans bundle (`node`, `rust-analyzer`, `zsh`…) est rattaché à
+  l'application qui l'a lancé — mais jamais à un parent système, sinon tout
+  finirait sous `launchd`.
+- **`démarrage auto`** signale une application lancée par un agent `launchd` :
+  c'est là que se cachent les mises à jour, agents et daemons qui tournent sans
+  qu'on le leur ait demandé. On les coupe avec `detox-mac agents disable <label>`.
+- La mémoire affichée est l'empreinte réelle (`top`), celle du Moniteur
+  d'activité ; `ps` sert de repli si elle n'est pas disponible.
+
+### Arrêter une application entière
+
+Les numéros de la colonne de gauche servent de raccourci pour `kill` :
+
+```bash
+detox-mac kill 3               # le 3e groupe du dernier detox-mac ram
+detox-mac kill discord         # par nom
+detox-mac kill vs code         # « vs code » retrouve « Visual Studio Code »
+detox-mac kill spotify --force # SIGKILL, si SIGTERM n'a pas suffi
+detox-mac kill -n discord      # simulation : liste les processus visés
+```
+
+`kill` envoie `SIGTERM` à **tous** les processus du groupe, les racines d'abord
+pour que les helpers s'arrêtent proprement, puis vérifie qui a survécu.
+
+- Le numéro n'est qu'un raccourci vers un **nom** : la cible est re-résolue et
+  affichée avant la confirmation, donc un classement qui a bougé entre deux
+  commandes ne peut pas faire tuer la mauvaise application.
+- Un nom ambigu n'est jamais deviné : les candidats sont listés.
+- Les composants de macOS sont refusés sans `--system`.
+- Le processus `detox-mac` lui-même n'est jamais tué ; si la cible contient le
+  terminal qui exécute la commande, l'outil le signale avant de demander confirmation.
 
 ---
 
@@ -92,6 +157,12 @@ detox-mac clean cache logs trash --yes
 # Voir ce qu'un nettoyage complet libérerait
 detox-mac clean all --dry-run
 
+# Ce qui occupe la RAM, avec le détail des processus
+detox-mac ram --detail --top 5
+
+# Couper une application qui traîne
+detox-mac kill discord
+
 # Les 30 plus grosses applications
 detox-mac apps --top 30
 
@@ -116,6 +187,7 @@ detox-mac completions zsh > ~/.zsh/completions/_detox-mac
 ### Sortie JSON
 
 ```bash
+detox-mac ram --json | jq '.groups[] | select(.autostart) | .name'
 detox-mac scan all --json | jq '.total'
 detox-mac agents list --json | jq '.agents[] | select(.apple == false) | .label'
 ```
@@ -171,6 +243,7 @@ src/
     ├── clean.rs       #   Cibles de nettoyage : mesure et suppression
     ├── docker.rs      #   Détection Docker et purges
     ├── agents.rs      #   Agents de démarrage launchd
+    ├── ram.rs         #   Photographie mémoire, regroupement, arrêt de groupe
     ├── maintenance.rs #   DNS, Spotlight, mémoire, instantanés, mises à jour
     └── scan.rs        #   Applications et gros fichiers
 ```
@@ -201,6 +274,8 @@ composable, testable.
 | Onglet *Système* | `detox-mac sys <opération>` |
 | Onglet *Démarrage* | `detox-mac agents <sous-commande>` |
 | Dashboard de démarrage | `detox-mac info` |
+| *(nouveau)* | `detox-mac ram` — inspection mémoire par application |
+| *(nouveau)* | `detox-mac kill <nom>` — arrêt d'une application entière |
 
 `ratatui` et `crossterm` ne sont plus des dépendances.
 

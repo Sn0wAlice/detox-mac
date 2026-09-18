@@ -11,6 +11,7 @@ use crate::sys::machine::Machine;
 use crate::task::agents::{self, Action, Agent, Scope};
 use crate::task::clean::{self, Target};
 use crate::task::maintenance;
+use crate::task::ram;
 use crate::task::scan;
 use crate::task::{Ctx, Outcome, Status};
 use crate::ui::Printer;
@@ -41,6 +42,17 @@ pub fn run(cli: Cli) -> bool {
             path,
             depth,
         } => files(&ctx, min, top, path, depth),
+        Command::Ram {
+            top,
+            all,
+            detail,
+            min,
+        } => ram(&ctx, top, all, detail, min),
+        Command::Kill {
+            target,
+            force,
+            system,
+        } => kill(&ctx, &target.join(" "), force, system),
         Command::Agents { command } => match command {
             AgentCommand::List { third_party, scope } => list_agents(&ctx, third_party, scope),
             AgentCommand::Disable { selection } => act_on_agents(&ctx, Action::Disable, selection),
@@ -108,6 +120,16 @@ fn info(ctx: &Ctx) -> bool {
             format::size(machine.memory.inactive),
         ),
     );
+    if machine.swap.total > 0 {
+        p.field(
+            "Swap",
+            format!(
+                "{} utilisé sur {}",
+                format::size(machine.swap.used),
+                format::size(machine.swap.total)
+            ),
+        );
+    }
     if let Some(disk) = &machine.disk {
         p.field(
             "Disque",
@@ -136,6 +158,7 @@ fn info(ctx: &Ctx) -> bool {
     p.heading("Démarrage");
     p.field("Agents", format!("{third_party} tiers, {apple} Apple"));
     p.info("");
+    p.info(p.dim("  detox-mac ram         pour voir qui mange la mémoire"));
     p.info(p.dim("  detox-mac scan all    pour une mesure complète"));
     p.info(p.dim("  detox-mac clean all   pour tout nettoyer"));
     true
@@ -329,6 +352,266 @@ fn files(ctx: &Ctx, min: u64, top: usize, path: Option<PathBuf>, depth: usize) -
         p.info(p.dim(&format!("  … et {} autre(s)", files.len() - shown.len())));
     }
     true
+}
+
+// ── mémoire ─────────────────────────────────────────────────────────────────
+
+fn ram(ctx: &Ctx, top: usize, all: bool, detail: bool, min: u64) -> bool {
+    let snapshot = ram::snapshot(all);
+    let groups: Vec<&ram::Group> = snapshot
+        .groups
+        .iter()
+        .filter(|group| group.bytes >= min)
+        .collect();
+    let shown = take(&groups, top);
+
+    if ctx.json {
+        emit(json!({
+            "memory": snapshot.memory,
+            "swap": snapshot.swap,
+            "free_percent": snapshot.free_percent,
+            "listed_bytes": snapshot.listed_bytes(),
+            "hidden_groups": snapshot.hidden_groups,
+            "hidden_bytes": snapshot.hidden_bytes,
+            "groups": shown,
+        }));
+        return true;
+    }
+
+    let p = &ctx.printer;
+    let memory = &snapshot.memory;
+
+    p.heading("Mémoire");
+    p.field(
+        "Physique",
+        format!(
+            "{} — {} utilisée, {} libre, {} inactive",
+            format::size(memory.total),
+            format::size(memory.used),
+            format::size(memory.free),
+            format::size(memory.inactive)
+        ),
+    );
+    if snapshot.swap.total > 0 {
+        p.field(
+            "Swap",
+            format!(
+                "{} utilisé sur {}",
+                format::size(snapshot.swap.used),
+                format::size(snapshot.swap.total)
+            ),
+        );
+    }
+    if let Some(free) = snapshot.free_percent {
+        p.field("Pression", format!("{free} % de mémoire libre"));
+    }
+
+    p.heading(&format!(
+        "{} ({} groupe(s) — {})",
+        if all {
+            "Tous les processus"
+        } else {
+            "Processus hors macOS"
+        },
+        groups.len(),
+        format::size(groups.iter().map(|g| g.bytes).sum::<u64>())
+    ));
+
+    for (index, group) in shown.iter().enumerate() {
+        let mut tags = Vec::new();
+        if group.autostart {
+            tags.push("démarrage auto".to_string());
+        }
+        if group.system {
+            tags.push("système".to_string());
+        }
+        tags.push(format!("{} proc.", group.processes.len()));
+
+        p.info(format!(
+            "  {:>3}. {:>10}  {:<34} {}",
+            index + 1,
+            format::size(group.bytes),
+            format::truncate(&group.name, 34),
+            p.dim(&tags.join(" · "))
+        ));
+
+        if detail {
+            const DETAIL_LIMIT: usize = 8;
+            for process in group.processes.iter().take(DETAIL_LIMIT) {
+                p.info(format!(
+                    "                   {:>10}  {}",
+                    format::size(process.bytes),
+                    p.dim(&format!("{} [{}]", process.name, process.pid))
+                ));
+            }
+            if group.processes.len() > DETAIL_LIMIT {
+                p.info(p.dim(&format!(
+                    "                   … et {} processus plus petits",
+                    group.processes.len() - DETAIL_LIMIT
+                )));
+            }
+        }
+    }
+
+    if shown.len() < groups.len() {
+        p.info(p.dim(&format!(
+            "  … et {} groupe(s) de moins de {}",
+            groups.len() - shown.len(),
+            format::size(shown.last().map_or(0, |g| g.bytes))
+        )));
+    }
+
+    if snapshot.hidden_groups > 0 {
+        p.info("");
+        p.info(p.dim(&format!(
+            "  {} composant(s) macOS/Apple masqué(s) ({}) — voir --all",
+            snapshot.hidden_groups,
+            format::size(snapshot.hidden_bytes)
+        )));
+    }
+    ram::remember(shown);
+    p.info("");
+    p.info(p.dim("  detox-mac kill <numéro|nom>   arrête tous les processus d'une application"));
+    if shown.iter().any(|group| group.autostart) {
+        p.info(p.dim(
+            "  « démarrage auto » = lancé par un agent launchd ; detox-mac agents disable <label>",
+        ));
+    }
+
+    true
+}
+
+// ── arrêt d'une application ─────────────────────────────────────────────────
+
+fn kill(ctx: &Ctx, query: &str, force: bool, allow_system: bool) -> bool {
+    let p = &ctx.printer;
+
+    // Un numéro renvoie au nom affiché lors du dernier `detox-mac ram`.
+    let query = match query.trim().parse::<usize>() {
+        Ok(index) => match ram::recall(index) {
+            Some(name) => name,
+            None => {
+                p.error(format!(
+                    "aucun groupe n° {index} en mémoire — lancez d'abord detox-mac ram"
+                ));
+                return false;
+            }
+        },
+        Err(_) => query.trim().to_string(),
+    };
+
+    let snapshot = ram::snapshot(true);
+    let group = match ram::find(&snapshot.groups, &query) {
+        ram::Lookup::One(group) => group,
+        ram::Lookup::Ambiguous(names) => {
+            p.error(format!("« {query} » correspond à plusieurs applications :"));
+            for name in names {
+                p.item(name);
+            }
+            p.item(p.dim("précisez le nom, ou utilisez le numéro affiché par detox-mac ram"));
+            return false;
+        }
+        ram::Lookup::None => {
+            p.error(format!("aucune application nommée « {query} » ne tourne."));
+            return false;
+        }
+    };
+
+    if group.system && !allow_system {
+        p.error(format!(
+            "{} est un composant de macOS — ajoutez --system pour l'arrêter quand même.",
+            group.name
+        ));
+        return false;
+    }
+
+    let ancestors = ram::own_ancestors(&snapshot.groups);
+    let suicidal = group
+        .processes
+        .iter()
+        .any(|process| ancestors.contains(&process.pid));
+
+    if !ctx.json {
+        p.heading(&format!(
+            "{} — {} processus, {}",
+            group.name,
+            group.processes.len(),
+            format::size(group.bytes)
+        ));
+        for process in group.processes.iter().take(8) {
+            p.info(format!(
+                "  {:>10}  {}",
+                format::size(process.bytes),
+                p.dim(&format!("{} [{}]", process.name, process.pid))
+            ));
+        }
+        if group.processes.len() > 8 {
+            p.info(p.dim(&format!(
+                "  … et {} processus plus petits",
+                group.processes.len() - 8
+            )));
+        }
+    }
+
+    if suicidal {
+        p.warn("ce groupe contient le terminal qui exécute detox-mac : la commande sera interrompue en même temps.");
+    }
+    if force {
+        p.warn("SIGKILL : les applications n'auront pas la possibilité d'enregistrer.");
+    }
+
+    if !ctx.confirm(&format!(
+        "Arrêter {} ({} processus) ?",
+        group.name,
+        group.processes.len()
+    )) {
+        if !ctx.json {
+            p.info("Annulé.");
+        }
+        return false;
+    }
+
+    let report = ram::kill(group, force, ctx.dry_run);
+
+    if ctx.json {
+        emit(json!({ "dry_run": ctx.dry_run, "result": report }));
+        return report.survived.is_empty() && report.errors.is_empty();
+    }
+
+    p.info("");
+    if report.terminated.is_empty() {
+        p.error(format!("{} — aucun processus arrêté", report.group));
+    } else {
+        let summary = format!(
+            "{} — {} processus arrêté(s), {} libéré(s)",
+            report.group,
+            report.terminated.len(),
+            format::size(report.bytes)
+        );
+        if ctx.dry_run {
+            p.success(format!("{summary} [simulation]"));
+        } else {
+            p.success(summary);
+        }
+    }
+
+    for error in &report.errors {
+        p.item(p.dim(error));
+    }
+    if !report.survived.is_empty() {
+        p.warn(format!(
+            "{} processus toujours vivants : {} — réessayez avec --force",
+            report.survived.len(),
+            report
+                .survived
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    report.errors.is_empty() && report.survived.is_empty() && !report.terminated.is_empty()
 }
 
 // ── agents ──────────────────────────────────────────────────────────────────

@@ -4,6 +4,7 @@ pub mod agents;
 pub mod clean;
 pub mod docker;
 pub mod maintenance;
+pub mod ram;
 pub mod scan;
 
 use serde::Serialize;

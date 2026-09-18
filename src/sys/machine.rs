@@ -12,6 +12,7 @@ pub struct Machine {
     pub cpu: String,
     pub cores: u32,
     pub memory: Memory,
+    pub swap: Swap,
     pub disk: Option<Disk>,
     pub uptime: String,
 }
@@ -22,6 +23,51 @@ pub struct Memory {
     pub used: u64,
     pub free: u64,
     pub inactive: u64,
+}
+
+/// Utilisation du fichier d'échange.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct Swap {
+    pub total: u64,
+    pub used: u64,
+}
+
+impl Swap {
+    /// Lit `vm.swapusage` : `total = 4096.00M  used = 2520.88M  free = 1575.12M`.
+    pub fn collect() -> Self {
+        let Some(raw) = cmd::sysctl("vm.swapusage") else {
+            return Self::default();
+        };
+
+        let field = |key: &str| -> u64 {
+            raw.split(key)
+                .nth(1)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(parse_swap_size)
+                .unwrap_or(0)
+        };
+
+        Self {
+            total: field("total ="),
+            used: field("used ="),
+        }
+    }
+}
+
+/// Analyse une taille de `vm.swapusage` : `4096.00M`, `1.50G`.
+fn parse_swap_size(input: &str) -> Option<u64> {
+    let split = input.find(|c: char| !c.is_ascii_digit() && c != '.')?;
+    let (number, unit) = input.split_at(split);
+    let value: f64 = number.parse().ok()?;
+
+    let multiplier = match unit {
+        "K" => 1024.0,
+        "M" => 1024.0 * 1024.0,
+        "G" => 1024.0 * 1024.0 * 1024.0,
+        _ => return None,
+    };
+
+    Some((value * multiplier) as u64)
 }
 
 #[derive(Debug, Default, Clone, Serialize)]
@@ -48,6 +94,7 @@ impl Machine {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0),
             memory: Memory::collect(),
+            swap: Swap::collect(),
             disk: Disk::collect("/"),
             uptime: uptime(),
         }
@@ -97,7 +144,7 @@ fn uptime() -> String {
 }
 
 impl Memory {
-    fn collect() -> Self {
+    pub fn collect() -> Self {
         let total = cmd::sysctl("hw.memsize")
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
@@ -162,5 +209,17 @@ impl Disk {
             free: kb(3),
             used_percent: fields[4].trim_end_matches('%').parse().unwrap_or(0),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_swap_sizes() {
+        assert_eq!(parse_swap_size("4096.00M"), Some(4096 * 1024 * 1024));
+        assert_eq!(parse_swap_size("1.50G"), Some(1024 * 1024 * 1024 * 3 / 2));
+        assert_eq!(parse_swap_size("0"), None);
     }
 }

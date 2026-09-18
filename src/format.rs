@@ -59,6 +59,15 @@ pub fn tilde(path: &std::path::Path) -> String {
     }
 }
 
+/// Tronque un texte trop long pour sa colonne, avec une ellipse.
+pub fn truncate(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(width.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -78,6 +87,12 @@ mod tests {
         assert_eq!(parse_size("1.5g").unwrap(), GIB + GIB / 2);
         assert_eq!(parse_size("200 Ko").unwrap(), 200 * KIB);
         assert_eq!(parse_size("2gb").unwrap(), 2 * GIB);
+    }
+
+    #[test]
+    fn truncates_only_when_needed() {
+        assert_eq!(truncate("Docker", 10), "Docker");
+        assert_eq!(truncate("at.obdev.littlesnitch.daemon", 12), "at.obdev.li…");
     }
 
     #[test]
