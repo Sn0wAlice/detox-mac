@@ -1,7 +1,8 @@
-//! Tâches de maintenance, indépendantes de l'affichage.
+//! Maintenance tasks, independent of how results are displayed.
 
 pub mod agents;
 pub mod clean;
+pub mod dev;
 pub mod docker;
 pub mod maintenance;
 pub mod ram;
@@ -11,49 +12,49 @@ use serde::Serialize;
 
 use crate::ui::Printer;
 
-/// Contexte partagé par toutes les tâches.
+/// Context shared by every task.
 #[derive(Debug, Clone, Copy)]
 pub struct Ctx {
-    /// Ne rien modifier, seulement mesurer.
+    /// Measure only, change nothing.
     pub dry_run: bool,
-    /// Répondre « oui » à toutes les confirmations.
+    /// Answer yes to every confirmation.
     pub yes: bool,
-    /// Sortie machine : aucune confirmation interactive possible.
+    /// Machine-readable output: no interactive prompt is possible.
     pub json: bool,
     pub printer: Printer,
 }
 
 impl Ctx {
-    /// Demande confirmation, sauf en simulation ou si `--yes` est passé.
+    /// Asks for confirmation, unless simulating or `--yes` was passed.
     pub fn confirm(&self, question: &str) -> bool {
         if self.dry_run || self.yes {
             return true;
         }
         if self.json {
             self.printer
-                .error("confirmation requise : ajoutez --yes en mode --json.");
+                .error("confirmation required: add --yes when using --json.");
             return false;
         }
         self.printer.confirm(question)
     }
 }
 
-/// État final d'une opération.
+/// Final state of an operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Status {
-    /// Effectuée.
+    /// Carried out.
     Ok,
-    /// Simulée (`--dry-run`).
+    /// Simulated (`--dry-run`).
     Simulated,
-    /// Non applicable (outil absent, dossier vide, refus de l'utilisateur).
+    /// Not applicable (missing tool, empty directory, user declined).
     Skipped,
-    /// Échec.
+    /// Failed.
     Failed,
 }
 
 impl Status {
-    /// Statut d'une opération réussie, selon le mode.
+    /// Status of a successful operation, depending on the mode.
     pub fn done(dry_run: bool) -> Self {
         if dry_run { Self::Simulated } else { Self::Ok }
     }
@@ -63,7 +64,7 @@ impl Status {
     }
 }
 
-/// Résultat générique d'une action système.
+/// Generic result of a system action.
 #[derive(Debug, Clone, Serialize)]
 pub struct Outcome {
     pub action: String,
@@ -101,11 +102,11 @@ impl Outcome {
         self.messages.push(message.into());
     }
 
-    /// Affiche le résultat au format texte.
+    /// Renders the outcome as text.
     pub fn render(&self, printer: &Printer) {
         match self.status {
             Status::Ok => printer.success(&self.action),
-            Status::Simulated => printer.success(format!("{} [simulation]", self.action)),
+            Status::Simulated => printer.success(format!("{} [dry run]", self.action)),
             Status::Skipped => printer.skipped(&self.action),
             Status::Failed => printer.error(&self.action),
         }

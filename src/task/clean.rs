@@ -1,4 +1,4 @@
-//! Cibles de nettoyage : mesure et suppression.
+//! Cleaning targets: measurement and removal.
 
 use std::path::PathBuf;
 
@@ -8,33 +8,33 @@ use super::{Ctx, Status, docker};
 use crate::format;
 use crate::sys::{cmd, fsx};
 
-/// Une zone du disque que `detox-mac` sait mesurer et nettoyer.
+/// An area of the disk `detox-mac` knows how to measure and clean.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 #[value(rename_all = "kebab-case")]
 pub enum Target {
-    /// Caches utilisateur (`~/Library/Caches`).
+    /// User caches (`~/Library/Caches`).
     Cache,
-    /// Corbeille utilisateur (`~/.Trash`).
+    /// User trash (`~/.Trash`).
     Trash,
-    /// Corbeille utilisateur + corbeilles des volumes montés.
+    /// User trash plus the trash of every mounted volume.
     TrashAll,
-    /// Journaux utilisateur (`~/Library/Logs`).
+    /// User logs (`~/Library/Logs`).
     Logs,
-    /// Fichiers `.DS_Store` du dossier personnel.
+    /// `.DS_Store` files in the home directory.
     DsStore,
-    /// Cache de téléchargement Homebrew.
+    /// Homebrew download cache.
     Homebrew,
-    /// Docker : conteneurs, images et caches de build inutilisés (jamais les volumes).
+    /// Docker: unused containers, images and build caches (never volumes).
     Docker,
-    /// Données Xcode : DerivedData, DeviceSupport, caches du simulateur.
+    /// Xcode data: DerivedData, DeviceSupport, simulator caches.
     Xcode,
-    /// Appareils du simulateur iOS (lourd, à demander explicitement).
+    /// iOS simulator devices (heavy, must be asked for explicitly).
     Simulators,
 }
 
 impl Target {
-    /// Cibles incluses par `--all` (les simulateurs en sont volontairement exclus).
+    /// Targets covered by `all` (simulators are deliberately left out).
     pub const DEFAULT: [Target; 8] = [
         Target::Cache,
         Target::Trash,
@@ -46,24 +46,24 @@ impl Target {
         Target::Xcode,
     ];
 
-    /// Cibles mesurées par `detox-mac scan` sans option.
+    /// Targets measured by a bare `detox-mac scan`.
     pub const QUICK: [Target; 4] = [Target::Cache, Target::Trash, Target::Logs, Target::Xcode];
 
     pub fn label(self) -> &'static str {
         match self {
-            Target::Cache => "Caches utilisateur",
-            Target::Trash => "Corbeille",
-            Target::TrashAll => "Corbeilles (tous volumes)",
-            Target::Logs => "Journaux",
-            Target::DsStore => "Fichiers .DS_Store",
-            Target::Homebrew => "Cache Homebrew",
+            Target::Cache => "User caches",
+            Target::Trash => "Trash",
+            Target::TrashAll => "Trash (all volumes)",
+            Target::Logs => "Logs",
+            Target::DsStore => ".DS_Store files",
+            Target::Homebrew => "Homebrew cache",
             Target::Docker => "Docker (images, builds)",
-            Target::Xcode => "Données Xcode",
-            Target::Simulators => "Simulateurs iOS",
+            Target::Xcode => "Xcode data",
+            Target::Simulators => "iOS simulators",
         }
     }
 
-    /// Nom court utilisé sur la ligne de commande.
+    /// Short name used on the command line.
     pub fn slug(self) -> &'static str {
         match self {
             Target::Cache => "cache",
@@ -102,17 +102,17 @@ impl Target {
 }
 
 enum Strategy {
-    /// Vider le contenu de ces dossiers.
+    /// Empty the contents of these directories.
     Dirs(Vec<PathBuf>),
-    /// Parcourir le dossier personnel à la recherche des `.DS_Store`.
+    /// Walk the home directory looking for `.DS_Store` files.
     DsStore,
-    /// Déléguer à `brew cleanup`.
+    /// Delegate to `brew cleanup`.
     Homebrew,
-    /// Déléguer aux commandes `docker … prune`.
+    /// Delegate to the `docker … prune` commands.
     Docker,
 }
 
-/// Corbeille utilisateur + `.Trashes` de chaque volume monté.
+/// User trash plus the `.Trashes` of every mounted volume.
 fn all_trashes() -> Vec<PathBuf> {
     let mut dirs = vec![fsx::home_join(".Trash")];
     if let Ok(volumes) = std::fs::read_dir("/Volumes") {
@@ -126,16 +126,16 @@ fn all_trashes() -> Vec<PathBuf> {
     dirs
 }
 
-/// Espace occupé par une cible.
+/// Space taken by a target.
 #[derive(Debug, Clone, Serialize)]
 pub struct Measure {
     pub target: Target,
     pub label: &'static str,
-    /// Octets récupérables.
+    /// Reclaimable bytes.
     pub bytes: u64,
-    /// Nombre d'éléments concernés.
+    /// Number of items involved.
     pub items: usize,
-    /// Raison pour laquelle la cible n'est pas disponible sur cette machine.
+    /// Why the target is unavailable on this machine.
     pub unavailable: Option<String>,
 }
 
@@ -151,13 +151,13 @@ impl Measure {
     }
 }
 
-/// Mesure l'espace récupérable d'une cible, sans rien modifier.
+/// Measures the reclaimable space of a target, changing nothing.
 pub fn measure(target: Target) -> Measure {
     match target.strategy() {
         Strategy::Dirs(dirs) => {
             let existing: Vec<&PathBuf> = dirs.iter().filter(|d| d.is_dir()).collect();
             if existing.is_empty() {
-                return Measure::unavailable(target, "dossier absent");
+                return Measure::unavailable(target, "directory not found");
             }
 
             let mut bytes = 0;
@@ -213,15 +213,15 @@ pub fn measure(target: Target) -> Measure {
     }
 }
 
-/// Résultat du nettoyage d'une cible.
+/// Result of cleaning a target.
 #[derive(Debug, Clone, Serialize)]
 pub struct Cleaned {
     pub target: Target,
     pub label: &'static str,
     pub status: Status,
-    /// Octets libérés (ou qui le seraient en simulation).
+    /// Bytes freed (or that would be, in dry-run mode).
     pub freed: u64,
-    /// Éléments supprimés.
+    /// Items removed.
     pub removed: usize,
     pub messages: Vec<String>,
 }
@@ -239,7 +239,7 @@ impl Cleaned {
     }
 }
 
-/// Nettoie une cible.
+/// Cleans a target.
 pub fn clean(target: Target, ctx: &Ctx) -> Cleaned {
     match target.strategy() {
         Strategy::Dirs(dirs) => clean_dirs(target, &dirs, ctx),
@@ -270,7 +270,7 @@ fn clean_docker(target: Target, ctx: &Ctx) -> Cleaned {
     }
 
     if reclaimable.bytes == 0 {
-        return Cleaned::skipped(target, "rien à récupérer");
+        return Cleaned::skipped(target, "nothing to reclaim");
     }
 
     match docker::prune() {
@@ -296,7 +296,7 @@ fn clean_docker(target: Target, ctx: &Ctx) -> Cleaned {
 fn clean_dirs(target: Target, dirs: &[PathBuf], ctx: &Ctx) -> Cleaned {
     let existing: Vec<&PathBuf> = dirs.iter().filter(|d| d.is_dir()).collect();
     if existing.is_empty() {
-        return Cleaned::skipped(target, "dossier absent");
+        return Cleaned::skipped(target, "directory not found");
     }
 
     let mut removal = fsx::Removal::default();
@@ -306,7 +306,7 @@ fn clean_dirs(target: Target, dirs: &[PathBuf], ctx: &Ctx) -> Cleaned {
         let result = fsx::empty_dir(dir, ctx.dry_run);
         if result.removed > 0 {
             messages.push(format!(
-                "{} — {} ({} élément(s))",
+                "{} — {} ({} item(s))",
                 format::tilde(dir),
                 format::size(result.freed),
                 result.removed
@@ -344,7 +344,7 @@ fn clean_homebrew(target: Target, ctx: &Ctx) -> Cleaned {
 
     let before = fsx::size_of(&cache);
     if before == 0 {
-        return Cleaned::skipped(target, "cache déjà vide");
+        return Cleaned::skipped(target, "cache already empty");
     }
 
     if ctx.dry_run {
@@ -385,10 +385,7 @@ fn finish(target: Target, removal: fsx::Removal, mut messages: Vec<String>, ctx:
     let failed = removal.removed == 0 && !removal.errors.is_empty();
     messages.extend(removal.errors.iter().take(5).cloned());
     if removal.errors.len() > 5 {
-        messages.push(format!(
-            "… et {} autre(s) erreur(s)",
-            removal.errors.len() - 5
-        ));
+        messages.push(format!("… and {} more error(s)", removal.errors.len() - 5));
     }
 
     let status = if failed {
@@ -400,7 +397,7 @@ fn finish(target: Target, removal: fsx::Removal, mut messages: Vec<String>, ctx:
     };
 
     if status == Status::Skipped && messages.is_empty() {
-        messages.push("rien à nettoyer".to_string());
+        messages.push("nothing to clean".to_string());
     }
 
     Cleaned {
@@ -413,21 +410,21 @@ fn finish(target: Target, removal: fsx::Removal, mut messages: Vec<String>, ctx:
     }
 }
 
-/// Chemin du cache Homebrew, ou la raison de son absence.
+/// Path of the Homebrew cache, or why there is none.
 fn homebrew_cache() -> Result<PathBuf, String> {
     if !cmd::exists("brew") {
-        return Err("Homebrew n'est pas installé".to_string());
+        return Err("Homebrew is not installed".to_string());
     }
     let cache = cmd::run("brew", &["--cache"])?;
     let path = PathBuf::from(cache.stdout);
     if path.is_dir() {
         Ok(path)
     } else {
-        Err("cache déjà vide".to_string())
+        Err("cache already empty".to_string())
     }
 }
 
-/// Liste les `.DS_Store` du dossier personnel avec leur taille.
+/// Lists the `.DS_Store` files of the home directory with their size.
 fn ds_store_files() -> Vec<(PathBuf, u64)> {
     let mut files = Vec::new();
     fsx::walk_files(&fsx::home(), 12, &mut |path, size| {

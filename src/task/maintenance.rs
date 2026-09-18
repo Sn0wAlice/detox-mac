@@ -1,14 +1,14 @@
-//! Opérations système : DNS, Spotlight, mémoire, instantanés, mises à jour.
+//! System operations: DNS, Spotlight, memory, snapshots, updates.
 
 use super::{Ctx, Outcome, Status};
 use crate::sys::cmd;
 
-/// Vide le cache DNS du système (nécessite root).
+/// Flushes the system DNS cache (requires root).
 pub fn flush_dns(ctx: &Ctx) -> Outcome {
-    let action = "Cache DNS";
+    let action = "DNS cache";
 
     if !cmd::is_root() {
-        return Outcome::skipped(action, "nécessite sudo — relancez la commande avec sudo");
+        return Outcome::skipped(action, "requires sudo — run the command again with sudo");
     }
     if ctx.dry_run {
         return Outcome::new(action, Status::Simulated)
@@ -22,19 +22,19 @@ pub fn flush_dns(ctx: &Ctx) -> Outcome {
         ("killall", vec!["-HUP", "mDNSResponder"]),
     ] {
         if let Err(err) = cmd::run(program, &args) {
-            return Outcome::failed(action, format!("{program} : {err}"));
+            return Outcome::failed(action, format!("{program}: {err}"));
         }
-        outcome.push(format!("{program} : ok"));
+        outcome.push(format!("{program}: ok"));
     }
     outcome
 }
 
-/// Réinitialise l'index Spotlight du volume racine (nécessite root).
+/// Rebuilds the Spotlight index of the boot volume (requires root).
 pub fn reindex_spotlight(ctx: &Ctx) -> Outcome {
-    let action = "Index Spotlight";
+    let action = "Spotlight index";
 
     if !cmd::is_root() {
-        return Outcome::skipped(action, "nécessite sudo — relancez la commande avec sudo");
+        return Outcome::skipped(action, "requires sudo — run the command again with sudo");
     }
     if ctx.dry_run {
         return Outcome::new(action, Status::Simulated).with("mdutil -E /");
@@ -46,12 +46,12 @@ pub fn reindex_spotlight(ctx: &Ctx) -> Outcome {
     }
 }
 
-/// Libère la mémoire inactive (nécessite root).
+/// Frees inactive memory (requires root).
 pub fn purge_memory(ctx: &Ctx) -> Outcome {
-    let action = "Mémoire inactive";
+    let action = "Inactive memory";
 
     if !cmd::is_root() {
-        return Outcome::skipped(action, "nécessite sudo — relancez la commande avec sudo");
+        return Outcome::skipped(action, "requires sudo — run the command again with sudo");
     }
     if ctx.dry_run {
         return Outcome::new(action, Status::Simulated).with("purge");
@@ -63,9 +63,9 @@ pub fn purge_memory(ctx: &Ctx) -> Outcome {
     }
 }
 
-/// Supprime les instantanés Time Machine locaux pour libérer l'espace purgeable.
+/// Removes local Time Machine snapshots to free purgeable space.
 pub fn thin_snapshots(ctx: &Ctx) -> Outcome {
-    let action = "Instantanés Time Machine locaux";
+    let action = "Local Time Machine snapshots";
 
     if ctx.dry_run {
         return Outcome::new(action, Status::Simulated)
@@ -84,18 +84,18 @@ pub fn thin_snapshots(ctx: &Ctx) -> Outcome {
     }
 }
 
-/// Liste les mises à jour macOS disponibles (lecture seule).
+/// Lists available macOS updates (read only).
 pub fn check_updates() -> Outcome {
-    let action = "Mises à jour macOS";
+    let action = "macOS updates";
 
-    // `softwareupdate -l` écrit son rapport sur stderr et sort parfois en erreur.
+    // `softwareupdate -l` writes its report on stderr and sometimes exits non-zero.
     let Ok(output) = cmd::run_raw("softwareupdate", &["-l"]) else {
-        return Outcome::failed(action, "softwareupdate est introuvable");
+        return Outcome::failed(action, "softwareupdate was not found");
     };
 
     let report = format!("{}\n{}", output.stdout, output.stderr);
     if report.contains("No new software available") {
-        return Outcome::ok(action, false).with("système à jour");
+        return Outcome::ok(action, false).with("system is up to date");
     }
 
     let mut outcome = Outcome::ok(action, false);
@@ -111,7 +111,7 @@ pub fn check_updates() -> Outcome {
     }
 
     if outcome.messages.is_empty() {
-        outcome.push("aucune information renvoyée par softwareupdate");
+        outcome.push("softwareupdate returned nothing");
     }
     outcome
 }

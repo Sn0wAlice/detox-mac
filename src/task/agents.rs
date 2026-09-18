@@ -1,4 +1,4 @@
-//! Agents et démons de démarrage (`launchd`).
+//! Startup agents and daemons (`launchd`).
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -10,7 +10,7 @@ use super::{Ctx, Outcome, Status};
 use crate::format;
 use crate::sys::{cmd, fsx};
 
-/// Emplacement d'un fichier `.plist`.
+/// Where a `.plist` file lives.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 #[value(rename_all = "kebab-case")]
@@ -28,9 +28,9 @@ impl Scope {
 
     pub fn label(self) -> &'static str {
         match self {
-            Scope::User => "LaunchAgents utilisateur",
-            Scope::System => "LaunchAgents système",
-            Scope::Daemon => "LaunchDaemons système",
+            Scope::User => "User LaunchAgents",
+            Scope::System => "System LaunchAgents",
+            Scope::Daemon => "System LaunchDaemons",
         }
     }
 
@@ -42,25 +42,25 @@ impl Scope {
         }
     }
 
-    /// Les démons système et les agents de `/Library` demandent root.
+    /// System daemons and `/Library` agents need root.
     pub fn needs_root(self) -> bool {
         !matches!(self, Scope::User)
     }
 }
 
-/// Un agent de démarrage.
+/// A startup agent.
 #[derive(Debug, Clone, Serialize)]
 pub struct Agent {
     pub label: String,
     pub path: PathBuf,
     pub scope: Scope,
-    /// `true` si le paquet vient d'Apple (jamais modifié par cet outil).
+    /// `true` when the package comes from Apple (never modified by this tool).
     pub apple: bool,
-    /// `true` si `launchctl` le connaît comme chargé.
+    /// `true` when `launchctl` reports it as loaded.
     pub loaded: bool,
 }
 
-/// Liste tous les agents visibles, triés par emplacement puis par label.
+/// Lists every visible agent, ordered by location then by label.
 pub fn collect() -> Vec<Agent> {
     let loaded = loaded_labels();
     let mut agents = Vec::new();
@@ -81,7 +81,7 @@ pub fn collect() -> Vec<Agent> {
     agents
 }
 
-/// Labels actuellement chargés d'après `launchctl list`.
+/// Labels currently loaded according to `launchctl list`.
 fn loaded_labels() -> HashSet<String> {
     let Ok(output) = cmd::run("launchctl", &["list"]) else {
         return HashSet::new();
@@ -103,12 +103,12 @@ fn label_of(path: &Path) -> String {
         .to_string()
 }
 
-/// Un agent fourni par Apple ne doit jamais être désactivé ni supprimé.
+/// An Apple-provided agent must never be disabled nor removed.
 fn is_apple(label: &str) -> bool {
     label.starts_with("com.apple.")
 }
 
-/// Action applicable à un agent.
+/// Action that can be applied to an agent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     Disable,
@@ -119,22 +119,22 @@ pub enum Action {
 impl Action {
     fn verb(self) -> &'static str {
         match self {
-            Action::Disable => "Désactivation",
-            Action::Enable => "Réactivation",
-            Action::Remove => "Suppression",
+            Action::Disable => "Disable",
+            Action::Enable => "Enable",
+            Action::Remove => "Remove",
         }
     }
 }
 
-/// Applique une action à un agent.
+/// Applies an action to an agent.
 pub fn apply(agent: &Agent, action: Action, ctx: &Ctx) -> Outcome {
-    let name = format!("{} : {}", action.verb(), agent.label);
+    let name = format!("{} {}", action.verb(), agent.label);
 
     if agent.apple {
-        return Outcome::skipped(name, "agent Apple — ignoré par sécurité");
+        return Outcome::skipped(name, "Apple agent — skipped for safety");
     }
     if agent.scope.needs_root() && !cmd::is_root() {
-        return Outcome::skipped(name, "nécessite sudo");
+        return Outcome::skipped(name, "requires sudo");
     }
 
     if ctx.dry_run {
@@ -153,7 +153,7 @@ pub fn apply(agent: &Agent, action: Action, ctx: &Ctx) -> Outcome {
         agent.path.as_os_str(),
     ];
     if let Err(err) = cmd::run("launchctl", &args) {
-        // `launchctl` râle souvent sur un service déjà (dé)chargé : ce n'est pas fatal.
+        // `launchctl` often complains about an already (un)loaded service; not fatal.
         outcome.push(format!("launchctl : {err}"));
     }
 
@@ -161,13 +161,13 @@ pub fn apply(agent: &Agent, action: Action, ctx: &Ctx) -> Outcome {
         if let Err(err) = fsx::remove(&agent.path, false) {
             return Outcome::failed(name, format!("{} : {err}", format::tilde(&agent.path)));
         }
-        outcome.push(format!("supprimé : {}", format::tilde(&agent.path)));
+        outcome.push(format!("removed: {}", format::tilde(&agent.path)));
     }
 
     outcome
 }
 
-/// Compte les agents par origine.
+/// Counts agents by origin.
 pub fn summary(agents: &[Agent]) -> (usize, usize) {
     let apple = agents.iter().filter(|a| a.apple).count();
     (apple, agents.len() - apple)

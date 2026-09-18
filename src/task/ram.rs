@@ -1,7 +1,7 @@
-//! Inspection de la mémoire vive, à la manière du Moniteur d'activité.
+//! Memory inspection, the way Activity Monitor does it.
 //!
-//! Les processus sont regroupés par application mère : les nombreux helpers
-//! d'un Electron ou d'un navigateur comptent pour une seule ligne.
+//! Processes are grouped by parent application: the many helpers of an Electron
+//! app or a browser count as a single line.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -12,64 +12,64 @@ use serde::Serialize;
 use super::agents;
 use crate::sys::{cmd, machine};
 
-/// Un processus vivant.
+/// A live process.
 #[derive(Debug, Clone, Serialize)]
 pub struct Process {
     pub pid: u32,
     pub ppid: u32,
     pub user: String,
-    /// Nom de l'exécutable.
+    /// Executable name.
     pub name: String,
     pub path: String,
-    /// Empreinte mémoire (`top`), sinon la taille résidente (`ps`).
+    /// Memory footprint (`top`), falling back to resident size (`ps`).
     pub bytes: u64,
-    /// Part de CPU moyenne depuis le lancement du processus.
+    /// Average CPU share since the process started.
     pub cpu: f64,
-    /// Durée depuis le lancement, telle que `ps` la donne (`3-04:12:33`).
+    /// Time since launch, as `ps` reports it (`3-04:12:33`).
     pub elapsed: String,
-    /// Ligne de commande complète, renseignée par `inspect` seulement.
+    /// Full command line, filled in by `inspect` only.
     pub args: Option<String>,
 }
 
-/// Un ensemble de processus rattachés à la même application.
+/// A set of processes belonging to the same application.
 #[derive(Debug, Clone, Serialize)]
 pub struct Group {
     pub name: String,
-    /// Bundle `.app` d'origine, quand il y en a un.
+    /// Originating `.app` bundle, when there is one.
     pub bundle: Option<PathBuf>,
     pub bytes: u64,
-    /// Composant du système ou application Apple.
+    /// A macOS component or an Apple application.
     pub system: bool,
-    /// Lancé automatiquement par un agent `launchd`.
+    /// Started automatically by a `launchd` agent.
     pub autostart: bool,
-    /// Labels des agents `launchd` qui démarrent cette application.
+    /// Labels of the `launchd` agents that start this application.
     pub agents: Vec<String>,
     pub processes: Vec<Process>,
 }
 
-/// Photographie de la mémoire à un instant donné.
+/// Snapshot of memory at a given moment.
 #[derive(Debug, Clone, Serialize)]
 pub struct Snapshot {
     pub memory: machine::Memory,
     pub swap: machine::Swap,
-    /// Pourcentage de mémoire libre d'après `memory_pressure`.
+    /// Percentage of free memory according to `memory_pressure`.
     pub free_percent: Option<u8>,
     pub groups: Vec<Group>,
-    /// Groupes système écartés de la liste (quand ils ne sont pas demandés).
+    /// System groups left out of the list (when they were not asked for).
     pub hidden_groups: usize,
     pub hidden_bytes: u64,
 }
 
 impl Snapshot {
-    /// Mémoire totale des groupes affichés.
+    /// Total memory of the listed groups.
     pub fn listed_bytes(&self) -> u64 {
         self.groups.iter().map(|g| g.bytes).sum()
     }
 }
 
-/// Construit la photographie courante.
+/// Builds the current snapshot.
 ///
-/// `include_system` conserve les processus Apple et les démons du système.
+/// `include_system` keeps Apple processes and system daemons.
 pub fn snapshot(include_system: bool) -> Snapshot {
     let processes = running_processes();
     let by_pid: HashMap<u32, usize> = processes
@@ -124,19 +124,19 @@ pub fn snapshot(include_system: bool) -> Snapshot {
     }
 }
 
-/// Application à laquelle rattacher un processus.
+/// Application a process should be attached to.
 struct Anchor {
     name: String,
     bundle: Option<PathBuf>,
     system: bool,
 }
 
-/// Rattache un processus à son application mère.
+/// Attaches a process to its parent application.
 ///
-/// On remonte la chaîne des parents tant que le processus n'appartient pas
-/// lui-même à un bundle : `rust-analyzer` se retrouve ainsi sous son éditeur.
-/// Un parent système n'absorbe jamais un processus tiers, sinon tout finirait
-/// regroupé sous `launchd`.
+/// The parent chain is walked as long as the process does not belong to a bundle
+/// itself, so `rust-analyzer` ends up under its editor.
+/// A system parent never absorbs a third-party process, otherwise everything
+/// would end up grouped under `launchd`.
 fn resolve_group(process: &Process, processes: &[Process], by_pid: &HashMap<u32, usize>) -> Anchor {
     if let Some((name, bundle)) = bundle_of(&process.path) {
         return Anchor {
@@ -173,7 +173,7 @@ fn resolve_group(process: &Process, processes: &[Process], by_pid: &HashMap<u32,
     }
 }
 
-/// Bundle `.app` le plus externe du chemin, et son nom.
+/// Outermost `.app` bundle of the path, and its name.
 fn bundle_of(path: &str) -> Option<(String, PathBuf)> {
     let mut bundle = PathBuf::new();
     for component in Path::new(path).components() {
@@ -186,7 +186,7 @@ fn bundle_of(path: &str) -> Option<(String, PathBuf)> {
     None
 }
 
-/// Emplacements appartenant à macOS ou à Apple.
+/// Locations belonging to macOS or to Apple.
 const SYSTEM_PREFIXES: &[&str] = &[
     "/System/",
     "/usr/",
@@ -197,7 +197,7 @@ const SYSTEM_PREFIXES: &[&str] = &[
     "/Library/PrivilegedHelperTools/com.apple.",
 ];
 
-/// Un processus est « système » s'il vient de macOS lui-même.
+/// A process is "system" when it comes from macOS itself.
 fn is_system(path: &str) -> bool {
     !path.starts_with('/')
         || path.contains("/Cryptexes/")
@@ -206,7 +206,7 @@ fn is_system(path: &str) -> bool {
             .any(|prefix| path.starts_with(prefix))
 }
 
-/// Liste les processus avec leur empreinte mémoire.
+/// Lists processes with their memory footprint.
 fn running_processes() -> Vec<Process> {
     let Ok(output) = cmd::run(
         "ps",
@@ -243,7 +243,7 @@ fn running_processes() -> Vec<Process> {
         .collect()
 }
 
-/// Découpe `count` champs en tête de ligne, et renvoie le reste tel quel.
+/// Splits `count` leading fields off a line and returns the rest untouched.
 fn split_fields(line: &str, count: usize) -> Option<(Vec<&str>, &str)> {
     let mut fields = Vec::with_capacity(count);
     let mut rest = line.trim_start();
@@ -257,7 +257,7 @@ fn split_fields(line: &str, count: usize) -> Option<(Vec<&str>, &str)> {
     (!rest.is_empty()).then_some((fields, rest))
 }
 
-/// Empreinte mémoire par PID, telle que l'affiche le Moniteur d'activité.
+/// Memory footprint per PID, the figure Activity Monitor shows.
 fn footprints() -> HashMap<u32, u64> {
     let Ok(output) = cmd::run("top", &["-l", "1", "-n", "20000", "-stats", "pid,mem"]) else {
         return HashMap::new();
@@ -276,7 +276,7 @@ fn footprints() -> HashMap<u32, u64> {
         .collect()
 }
 
-/// Analyse une taille affichée par `top` : `6257K`, `726M`, `1.2G`, `512B`.
+/// Parses a size printed by `top`: `6257K`, `726M`, `1.2G`, `512B`.
 fn parse_top_size(input: &str) -> Option<u64> {
     let text = input.trim_end_matches(['+', '-']);
     let split = text.find(|c: char| !c.is_ascii_digit() && c != '.')?;
@@ -295,7 +295,7 @@ fn parse_top_size(input: &str) -> Option<u64> {
     Some((value * multiplier) as u64)
 }
 
-/// Pourcentage de mémoire libre d'après `memory_pressure`.
+/// Percentage of free memory according to `memory_pressure`.
 fn free_percent() -> Option<u8> {
     let output = cmd::run("memory_pressure", &["-Q"]).ok()?;
     output
@@ -305,7 +305,7 @@ fn free_percent() -> Option<u8> {
         .and_then(|value| value.trim().trim_end_matches('%').parse().ok())
 }
 
-/// Groupes lancés automatiquement, avec le label de l'agent responsable.
+/// Groups started automatically, with the label of the agent responsible.
 fn autostart_groups() -> HashMap<String, Vec<String>> {
     let mut groups: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -327,9 +327,9 @@ fn autostart_groups() -> HashMap<String, Vec<String>> {
     groups
 }
 
-/// Lignes de commande complètes, par PID.
+/// Full command lines, per PID.
 ///
-/// Séparé de la liste principale : seul `inspect` en a besoin.
+/// Kept apart from the main listing: only `inspect` needs it.
 pub fn command_lines() -> HashMap<u32, String> {
     let Ok(output) = cmd::run("ps", &["-axwwo", "pid=,args="]) else {
         return HashMap::new();
@@ -345,7 +345,7 @@ pub fn command_lines() -> HashMap<u32, String> {
         .collect()
 }
 
-/// Complète un groupe avec la ligne de commande de chacun de ses processus.
+/// Fills in the command line of every process of a group.
 pub fn with_command_lines(group: &mut Group) {
     let lines = command_lines();
     for process in &mut group.processes {
@@ -353,9 +353,9 @@ pub fn with_command_lines(group: &mut Group) {
     }
 }
 
-/// Arbre parent → enfants à l'intérieur d'un groupe.
+/// Parent → children tree inside a group.
 ///
-/// Les racines sont les processus dont le parent est hors du groupe.
+/// Roots are the processes whose parent lies outside the group.
 pub fn tree(group: &Group) -> (Vec<&Process>, HashMap<u32, Vec<&Process>>) {
     let pids: HashSet<u32> = group.processes.iter().map(|p| p.pid).collect();
     let mut roots = Vec::new();
@@ -372,7 +372,7 @@ pub fn tree(group: &Group) -> (Vec<&Process>, HashMap<u32, Vec<&Process>>) {
     (roots, children)
 }
 
-/// Exécutable lancé par un agent, lu depuis son fichier `.plist`.
+/// Executable started by an agent, read from its `.plist` file.
 fn agent_program(plist: &Path) -> Option<String> {
     let args = [
         std::ffi::OsStr::new("-convert"),
@@ -390,25 +390,25 @@ fn agent_program(plist: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
-// ── désignation d'un groupe ─────────────────────────────────────────────────
+// ── naming a group ──────────────────────────────────────────────────────────
 
-/// Résultat d'une recherche de groupe par nom.
+/// Result of looking a group up by name.
 pub enum Lookup<'a> {
-    /// Un seul groupe correspond.
+    /// Exactly one group matches.
     One(&'a Group),
-    /// Plusieurs correspondances : il faut préciser.
+    /// Several matches: the query must be narrowed.
     Ambiguous(Vec<&'a str>),
-    /// Aucune correspondance.
+    /// No match at all.
     None,
 }
 
-/// Critère de correspondance entre un nom de groupe et une requête.
+/// Match test between a group name and a query.
 type Matcher = fn(&str, &str) -> bool;
 
-/// Du plus strict au plus permissif.
+/// From the strictest to the most permissive.
 ///
-/// La casse compte au premier tour : c'est ce qui distingue l'application
-/// `Claude` de l'exécutable `claude`, et rend les numéros de `ram` fiables.
+/// Case matters on the first pass: that is what tells the `Claude` application
+/// from the `claude` executable, and makes the `ram` numbers dependable.
 const MATCHERS: [Matcher; 4] = [
     |name, query| name == query,
     |name, query| name.to_lowercase() == query.to_lowercase(),
@@ -416,10 +416,10 @@ const MATCHERS: [Matcher; 4] = [
     matches_words,
 ];
 
-/// Retrouve un groupe à partir d'un nom approximatif.
+/// Finds a group from an approximate name.
 ///
-/// Par ordre de priorité : nom exact, nom contenant la requête, puis
-/// correspondance mot à mot (`vs code` retrouve `Visual Studio Code`).
+/// In order: exact name, name containing the query, then a letter-by-letter
+/// word match (`vs code` finds `Visual Studio Code`).
 pub fn find<'a>(groups: &'a [Group], query: &str) -> Lookup<'a> {
     let needle = query.trim();
 
@@ -439,10 +439,10 @@ pub fn find<'a>(groups: &'a [Group], query: &str) -> Lookup<'a> {
     Lookup::None
 }
 
-/// `vs code` et `vscode` retrouvent `Visual Studio Code`.
+/// `vs code` and `vscode` both find `Visual Studio Code`.
 ///
-/// Les mots du nom consomment la requête lettre à lettre, dans l'ordre : chaque
-/// mot en avale le plus long préfixe commun, et peut n'en avaler aucun.
+/// The words of the name consume the query letter by letter, in order: each word
+/// eats the longest common prefix, possibly none at all.
 fn matches_words(name: &str, query: &str) -> bool {
     let needle: String = query
         .chars()
@@ -477,14 +477,14 @@ fn matches_words(name: &str, query: &str) -> bool {
     false
 }
 
-// ── numéros mémorisés entre deux commandes ──────────────────────────────────
+// ── numbers remembered between two commands ─────────────────────────────────
 
-/// Fichier where `ram` note la liste affichée, pour que `kill 3` fonctionne.
+/// File where `ram` records the list it printed, so that `kill 3` works.
 fn state_path() -> PathBuf {
     std::env::temp_dir().join("detox-mac-ram.json")
 }
 
-/// Mémorise les groupes affichés, dans l'ordre.
+/// Remembers the groups that were displayed, in order.
 pub fn remember(groups: &[&Group]) {
     let names: Vec<&str> = groups.iter().map(|g| g.name.as_str()).collect();
     if let Ok(json) = serde_json::to_string(&names) {
@@ -492,7 +492,7 @@ pub fn remember(groups: &[&Group]) {
     }
 }
 
-/// Nom du groupe affiché à cette position lors du dernier `detox-mac ram`.
+/// Name of the group shown at this position by the last `detox-mac ram`.
 pub fn recall(index: usize) -> Option<String> {
     let raw = std::fs::read_to_string(state_path()).ok()?;
     let names: Vec<String> = serde_json::from_str(&raw).ok()?;
@@ -502,26 +502,26 @@ pub fn recall(index: usize) -> Option<String> {
         .cloned()
 }
 
-// ── arrêt d'une application ─────────────────────────────────────────────────
+// ── stopping an application ─────────────────────────────────────────────────
 
-/// Compte rendu d'un arrêt de groupe.
+/// Report of a group shutdown.
 #[derive(Debug, Clone, Serialize)]
 pub struct Killed {
     pub group: String,
     pub signal: &'static str,
-    /// Mémoire occupée par les processus visés.
+    /// Memory held by the targeted processes.
     pub bytes: u64,
-    /// Processus effectivement arrêtés.
+    /// Processes that actually stopped.
     pub terminated: Vec<u32>,
-    /// Processus toujours vivants après le signal.
+    /// Processes still alive after the signal.
     pub survived: Vec<u32>,
     pub errors: Vec<String>,
 }
 
-/// Envoie un signal à tous les processus d'un groupe.
+/// Sends a signal to every process of a group.
 ///
-/// Les processus racines partent en premier : les helpers d'un Electron
-/// s'arrêtent d'eux-mêmes et n'affichent pas de fenêtre de plantage.
+/// Root processes go first: the helpers of an Electron app then shut down on
+/// their own instead of showing a crash window.
 pub fn kill(group: &Group, force: bool, dry_run: bool) -> Killed {
     let signal = if force { "-KILL" } else { "-TERM" };
     let own = std::process::id();
@@ -550,7 +550,7 @@ pub fn kill(group: &Group, force: bool, dry_run: bool) -> Killed {
 
         match cmd::run("kill", &[signal, &process.pid.to_string()]) {
             Ok(_) => report.terminated.push(process.pid),
-            // Un enfant déjà parti avec son parent n'est pas une erreur.
+            // A child already gone with its parent is not an error.
             Err(err) if err.contains("No such process") => report.terminated.push(process.pid),
             Err(err) => report
                 .errors
@@ -574,12 +574,12 @@ pub fn kill(group: &Group, force: bool, dry_run: bool) -> Killed {
     report
 }
 
-/// Vrai si le processus existe encore.
+/// True when the process still exists.
 fn is_alive(pid: u32) -> bool {
     cmd::run("kill", &["-0", &pid.to_string()]).is_ok()
 }
 
-/// Ancêtres du processus courant, pour éviter de se saborder sans le savoir.
+/// Ancestors of the current process, so we never kill ourselves unknowingly.
 pub fn own_ancestors(groups: &[Group]) -> HashSet<u32> {
     let parents: HashMap<u32, u32> = groups
         .iter()

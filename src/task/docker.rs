@@ -1,11 +1,11 @@
-//! Nettoyage Docker : conteneurs, images, caches de build et réseaux inutilisés.
+//! Docker cleanup: unused containers, images, build caches and networks.
 //!
-//! Les volumes ne sont jamais touchés : ils contiennent les données des
-//! utilisateurs (bases, uploads…) et leur suppression n'est pas récupérable.
+//! Volumes are never touched: they hold user data (databases, uploads…) and
+//! removing them cannot be undone.
 
 use crate::sys::cmd;
 
-/// Commandes de purge exécutées, dans l'ordre.
+/// Prune commands, in the order they run.
 const PRUNE: [&[&str]; 4] = [
     &["container", "prune", "-f"],
     &["image", "prune", "-a", "-f"],
@@ -13,26 +13,26 @@ const PRUNE: [&[&str]; 4] = [
     &["network", "prune", "-f"],
 ];
 
-/// Vérifie que Docker est installé et que le démon répond.
+/// Checks that Docker is installed and that the daemon answers.
 pub fn availability() -> Result<(), String> {
     if !cmd::exists("docker") {
-        return Err("Docker n'est pas installé".to_string());
+        return Err("Docker is not installed".to_string());
     }
     match cmd::run("docker", &["version", "--format", "{{.Server.Version}}"]) {
         Ok(_) => Ok(()),
-        Err(_) => Err("le démon Docker ne tourne pas".to_string()),
+        Err(_) => Err("the Docker daemon is not running".to_string()),
     }
 }
 
-/// Espace récupérable d'après `docker system df`.
+/// Reclaimable space according to `docker system df`.
 #[derive(Debug, Default, Clone)]
 pub struct Reclaimable {
     pub bytes: u64,
-    /// Détail par type de ressource (images, conteneurs, cache de build).
+    /// Breakdown per resource type (images, containers, build cache).
     pub details: Vec<String>,
 }
 
-/// Interroge `docker system df` pour estimer l'espace récupérable.
+/// Queries `docker system df` to estimate the reclaimable space.
 pub fn reclaimable() -> Result<Reclaimable, String> {
     let output = cmd::run("docker", &["system", "df", "--format", "{{json .}}"])?;
     let mut result = Reclaimable::default();
@@ -42,7 +42,7 @@ pub fn reclaimable() -> Result<Reclaimable, String> {
             continue;
         };
         let kind = value["Type"].as_str().unwrap_or_default();
-        // Les volumes ne sont pas purgés : on ne les compte pas non plus.
+        // Volumes are never pruned, so they are not counted either.
         if kind.eq_ignore_ascii_case("Local Volumes") {
             continue;
         }
@@ -61,13 +61,13 @@ pub fn reclaimable() -> Result<Reclaimable, String> {
     Ok(result)
 }
 
-/// Résultat d'une purge.
+/// Result of a prune.
 pub struct Pruned {
     pub freed: u64,
     pub messages: Vec<String>,
 }
 
-/// Lance les purges Docker. Renvoie l'espace libéré et le détail des commandes.
+/// Runs the Docker prunes. Returns the freed space and a per-command detail.
 pub fn prune() -> Result<Pruned, String> {
     let mut freed = 0;
     let mut messages = Vec::new();
@@ -80,14 +80,14 @@ pub fn prune() -> Result<Pruned, String> {
                 freed += reclaimed;
                 messages.push(format!("{label} — {}", crate::format::size(reclaimed)));
             }
-            Err(err) => messages.push(format!("{label} — échec : {err}")),
+            Err(err) => messages.push(format!("{label} — failed: {err}")),
         }
     }
 
     Ok(Pruned { freed, messages })
 }
 
-/// Commandes qui seraient lancées, pour le mode simulation.
+/// Commands that would run, for dry-run mode.
 pub fn planned_commands() -> Vec<String> {
     PRUNE
         .iter()
@@ -95,7 +95,7 @@ pub fn planned_commands() -> Vec<String> {
         .collect()
 }
 
-/// Extrait `Total reclaimed space: 1.2GB` de la sortie d'un `prune`.
+/// Extracts `Total reclaimed space: 1.2GB` from a `prune` output.
 fn reclaimed_space(output: &str) -> Option<u64> {
     output
         .lines()
@@ -103,12 +103,12 @@ fn reclaimed_space(output: &str) -> Option<u64> {
         .and_then(|value| parse_size(value.trim()))
 }
 
-/// Analyse une taille telle que Docker l'affiche : `1.093GB`, `972.5MB`, `0B`.
+/// Parses a size the way Docker prints it: `1.093GB`, `972.5MB`, `0B`.
 ///
-/// Docker utilise des unités décimales, contrairement au reste de l'outil.
+/// Docker uses decimal units, unlike the rest of this tool.
 fn parse_size(input: &str) -> Option<u64> {
     let text = input.trim();
-    // `docker system df` renvoie « 1.2GB (57%) » : on ne garde que la taille.
+    // `docker system df` reports "1.2GB (57%)": keep the size only.
     let text = text.split_whitespace().next()?;
 
     let split = text.find(|c: char| !c.is_ascii_digit() && c != '.')?;
@@ -142,14 +142,14 @@ mod tests {
         assert_eq!(parse_size("1.093GB"), Some(1_093_000_000));
         assert_eq!(parse_size("2GiB"), Some(2 * 1024 * 1024 * 1024));
         assert_eq!(parse_size("1.2GB (57%)"), Some(1_200_000_000));
-        assert_eq!(parse_size("bientôt"), None);
+        assert_eq!(parse_size("soon"), None);
     }
 
     #[test]
     fn reads_reclaimed_space_from_prune_output() {
         let output = "Deleted Containers:\nabc123\n\nTotal reclaimed space: 1.5GB";
         assert_eq!(reclaimed_space(output), Some(1_500_000_000));
-        assert_eq!(reclaimed_space("rien à supprimer"), None);
+        assert_eq!(reclaimed_space("nothing to delete"), None);
     }
 
     #[test]

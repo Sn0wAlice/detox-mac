@@ -1,22 +1,22 @@
-//! Couche applicative : exécute les commandes et met en forme les résultats.
+//! Application layer: runs commands and formats their results.
 
 use std::path::PathBuf;
 
 use clap::CommandFactory;
 use serde_json::{Value, json};
 
-use crate::cli::{AgentCommand, Cli, Command, Selection, SysCommand, TargetArg};
+use crate::cli::{
+    AgentCommand, Cli, Command, DevFilter, FileCommand, Selection, SysCommand, TargetArg,
+};
 use crate::format;
+use crate::sys::fsx;
 use crate::sys::machine::Machine;
 use crate::task::agents::{self, Action, Agent, Scope};
 use crate::task::clean::{self, Target};
-use crate::task::maintenance;
-use crate::task::ram;
-use crate::task::scan;
-use crate::task::{Ctx, Outcome, Status};
+use crate::task::{Ctx, Outcome, Status, dev, maintenance, ram, scan};
 use crate::ui::Printer;
 
-/// Exécute la commande demandée. Renvoie `false` si une opération a échoué.
+/// Runs the requested command. Returns `false` when something failed.
 pub fn run(cli: Cli) -> bool {
     let options = cli.options;
     let printer = Printer::new(options.color, options.quiet || options.json);
@@ -36,18 +36,22 @@ pub fn run(cli: Cli) -> bool {
         Command::Scan { targets } => scan_targets(&ctx, resolve(&targets, &Target::QUICK)),
         Command::Clean { targets } => clean_targets(&ctx, resolve(&targets, &Target::DEFAULT)),
         Command::Apps { top } => apps(&ctx, top),
-        Command::Files {
-            min,
-            top,
-            path,
-            depth,
-        } => files(&ctx, min, top, path, depth),
+        Command::Files { command } => match command {
+            FileCommand::Large {
+                min,
+                top,
+                path,
+                depth,
+            } => large_files(&ctx, min, top, path, depth),
+            FileCommand::Dev { filter, top } => dev_residue(&ctx, &filter, top, None),
+            FileCommand::Clean { filter, native } => dev_residue(&ctx, &filter, 0, Some(native)),
+        },
         Command::Ram {
             top,
             all,
             detail,
             min,
-        } => ram(&ctx, top, all, detail, min),
+        } => memory(&ctx, top, all, detail, min),
         Command::Inspect { target, short } => inspect(&ctx, &target.join(" "), short),
         Command::Kill {
             target,
@@ -70,7 +74,7 @@ pub fn run(cli: Cli) -> bool {
     }
 }
 
-/// Cibles demandées, ou la sélection par défaut si l'utilisateur n'en donne pas.
+/// The requested targets, or the default selection when none were given.
 fn resolve(targets: &[TargetArg], fallback: &[Target]) -> Vec<Target> {
     if targets.is_empty() {
         fallback.to_vec()
@@ -82,16 +86,41 @@ fn resolve(targets: &[TargetArg], fallback: &[Target]) -> Vec<Target> {
 fn emit(value: Value) {
     match serde_json::to_string_pretty(&value) {
         Ok(text) => println!("{text}"),
-        Err(err) => eprintln!("erreur JSON : {err}"),
+        Err(err) => eprintln!("JSON error: {err}"),
     }
+}
+
+/// Keeps the first `top` items, or all of them when `top` is zero.
+fn take<T>(items: &[T], top: usize) -> &[T] {
+    if top == 0 {
+        items
+    } else {
+        &items[..top.min(items.len())]
+    }
+}
+
+/// Measures several targets, showing a progress bar.
+fn measure_targets(ctx: &Ctx, targets: &[Target]) -> Vec<clean::Measure> {
+    let mut progress = ctx.printer.bar("Measuring", targets.len());
+    let measures = targets
+        .iter()
+        .map(|&target| {
+            progress.tick(target.label());
+            let measure = clean::measure(target);
+            progress.advance(target.label());
+            measure
+        })
+        .collect();
+    progress.finish();
+    measures
 }
 
 // ── info ────────────────────────────────────────────────────────────────────
 
 fn info(ctx: &Ctx) -> bool {
     let machine = Machine::collect();
-    let measures: Vec<clean::Measure> = Target::QUICK.iter().map(|&t| clean::measure(t)).collect();
-    let reclaimable: u64 = measures.iter().map(|m| m.bytes).sum();
+    let measures = measure_targets(ctx, &Target::QUICK);
+    let reclaimable: u64 = measures.iter().map(|measure| measure.bytes).sum();
     let all_agents = agents::collect();
     let (apple, third_party) = agents::summary(&all_agents);
 
@@ -107,14 +136,14 @@ fn info(ctx: &Ctx) -> bool {
     let p = &ctx.printer;
     p.heading("Machine");
     if !machine.host.is_empty() {
-        p.field("Nom", &machine.host);
+        p.field("Name", &machine.host);
     }
     p.field("macOS", format!("{} ({})", machine.os, machine.build));
-    p.field("CPU", format!("{} — {} cœurs", machine.cpu, machine.cores));
+    p.field("CPU", format!("{} — {} cores", machine.cpu, machine.cores));
     p.field(
-        "Mémoire",
+        "Memory",
         format!(
-            "{} au total — {} utilisée, {} libre, {} inactive",
+            "{} total — {} used, {} free, {} inactive",
             format::size(machine.memory.total),
             format::size(machine.memory.used),
             format::size(machine.memory.free),
@@ -125,7 +154,7 @@ fn info(ctx: &Ctx) -> bool {
         p.field(
             "Swap",
             format!(
-                "{} utilisé sur {}",
+                "{} used of {}",
                 format::size(machine.swap.used),
                 format::size(machine.swap.total)
             ),
@@ -133,9 +162,9 @@ fn info(ctx: &Ctx) -> bool {
     }
     if let Some(disk) = &machine.disk {
         p.field(
-            "Disque",
+            "Disk",
             format!(
-                "{} libre sur {} ({} % utilisé)",
+                "{} free of {} ({}% used)",
                 format::size(disk.free),
                 format::size(disk.total),
                 disk.used_percent
@@ -143,10 +172,10 @@ fn info(ctx: &Ctx) -> bool {
         );
     }
     if !machine.uptime.is_empty() {
-        p.field("Allumé depuis", &machine.uptime);
+        p.field("Uptime", &machine.uptime);
     }
 
-    p.heading("Espace récupérable");
+    p.heading("Reclaimable space");
     for measure in &measures {
         render_measure(p, measure);
     }
@@ -156,12 +185,16 @@ fn info(ctx: &Ctx) -> bool {
         format::size(reclaimable)
     )));
 
-    p.heading("Démarrage");
-    p.field("Agents", format!("{third_party} tiers, {apple} Apple"));
+    p.heading("Startup");
+    p.field(
+        "Agents",
+        format!("{third_party} third-party, {apple} Apple"),
+    );
     p.info("");
-    p.info(p.dim("  detox-mac ram         pour voir qui mange la mémoire"));
-    p.info(p.dim("  detox-mac scan all    pour une mesure complète"));
-    p.info(p.dim("  detox-mac clean all   pour tout nettoyer"));
+    p.info(p.dim("  detox-mac ram         see what is eating memory"));
+    p.info(p.dim("  detox-mac files dev   find build residue in your projects"));
+    p.info(p.dim("  detox-mac scan all    measure everything"));
+    p.info(p.dim("  detox-mac clean all   clean everything"));
     true
 }
 
@@ -178,14 +211,14 @@ fn render_measure(p: &Printer, measure: &clean::Measure) {
             "  {:<28} {:>10}  {}",
             measure.label,
             format::size(measure.bytes),
-            p.dim(&format!("{} élément(s)", measure.items))
+            p.dim(&format!("{} item(s)", measure.items))
         )),
     }
 }
 
 fn scan_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
-    let measures: Vec<clean::Measure> = targets.iter().map(|&t| clean::measure(t)).collect();
-    let total: u64 = measures.iter().map(|m| m.bytes).sum();
+    let measures = measure_targets(ctx, &targets);
+    let total: u64 = measures.iter().map(|measure| measure.bytes).sum();
 
     if ctx.json {
         emit(json!({ "total": total, "targets": measures }));
@@ -193,7 +226,7 @@ fn scan_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
     }
 
     let p = &ctx.printer;
-    p.heading("Espace récupérable");
+    p.heading("Reclaimable space");
     for measure in &measures {
         render_measure(p, measure);
     }
@@ -204,17 +237,28 @@ fn scan_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
 // ── clean ───────────────────────────────────────────────────────────────────
 
 fn clean_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
-    let labels: Vec<&str> = targets.iter().map(|t| t.slug()).collect();
-    if !ctx.confirm(&format!("Nettoyer : {} ?", labels.join(", "))) {
+    let labels: Vec<&str> = targets.iter().map(|target| target.slug()).collect();
+    if !ctx.confirm(&format!("Clean: {}?", labels.join(", "))) {
         if !ctx.json {
-            ctx.printer.info("Annulé.");
+            ctx.printer.info("Cancelled.");
         }
         return false;
     }
 
-    let results: Vec<clean::Cleaned> = targets.iter().map(|&t| clean::clean(t, ctx)).collect();
-    let freed: u64 = results.iter().map(|r| r.freed).sum();
-    let failed = results.iter().any(|r| r.status.is_failure());
+    let mut progress = ctx.printer.bar("Cleaning", targets.len());
+    let results: Vec<clean::Cleaned> = targets
+        .iter()
+        .map(|&target| {
+            progress.tick(target.label());
+            let cleaned = clean::clean(target, ctx);
+            progress.advance(target.label());
+            cleaned
+        })
+        .collect();
+    progress.finish();
+
+    let freed: u64 = results.iter().map(|result| result.freed).sum();
+    let failed = results.iter().any(|result| result.status.is_failure());
 
     if ctx.json {
         emit(json!({
@@ -227,9 +271,9 @@ fn clean_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
 
     let p = &ctx.printer;
     p.heading(if ctx.dry_run {
-        "Nettoyage (simulation)"
+        "Cleanup (dry run)"
     } else {
-        "Nettoyage"
+        "Cleanup"
     });
 
     for result in &results {
@@ -244,7 +288,7 @@ fn clean_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
         }
 
         let details = if result.removed > 0 {
-            p.dim(&format!("{} élément(s)", result.removed))
+            p.dim(&format!("{} item(s)", result.removed))
         } else {
             String::new()
         };
@@ -269,27 +313,33 @@ fn clean_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
     p.info(format!(
         "  {} {}",
         if ctx.dry_run {
-            "Récupérable :"
+            "Reclaimable:"
         } else {
-            "Libéré :"
+            "Freed:"
         },
         p.accent(&format::size(freed))
     ));
     !failed
 }
 
-// ── apps & fichiers ─────────────────────────────────────────────────────────
-
-fn take<T: Clone>(items: &[T], top: usize) -> &[T] {
-    if top == 0 {
-        items
-    } else {
-        &items[..top.min(items.len())]
-    }
-}
+// ── applications and large files ────────────────────────────────────────────
 
 fn apps(ctx: &Ctx, top: usize) -> bool {
-    let apps = scan::applications();
+    let bundles = scan::application_bundles();
+    let mut progress = ctx.printer.bar("Measuring", bundles.len());
+
+    let mut apps: Vec<scan::Entry> = bundles
+        .iter()
+        .map(|bundle| {
+            progress.tick(&bundle.file_stem().unwrap_or_default().to_string_lossy());
+            let entry = scan::measure_application(bundle);
+            progress.advance(&entry.name);
+            entry
+        })
+        .collect();
+    progress.finish();
+
+    apps.sort_by_key(|app| std::cmp::Reverse(app.bytes));
     let shown = take(&apps, top);
 
     if ctx.json {
@@ -307,20 +357,26 @@ fn apps(ctx: &Ctx, top: usize) -> bool {
         p.info(format!("  {:>10}  {}", format::size(app.bytes), app.name));
     }
     if shown.len() < apps.len() {
-        p.info(p.dim(&format!("  … et {} autre(s)", apps.len() - shown.len())));
+        p.info(p.dim(&format!("  … and {} more", apps.len() - shown.len())));
     }
     true
 }
 
-fn files(ctx: &Ctx, min: u64, top: usize, path: Option<PathBuf>, depth: usize) -> bool {
-    let root = path.unwrap_or_else(crate::sys::fsx::home);
+fn large_files(ctx: &Ctx, min: u64, top: usize, path: Option<PathBuf>, depth: usize) -> bool {
+    let root = path.unwrap_or_else(fsx::home);
     if !root.is_dir() {
         ctx.printer
-            .error(format!("{} n'est pas un dossier", root.display()));
+            .error(format!("{} is not a directory", root.display()));
         return false;
     }
 
-    let files = scan::large_files(&root, min, depth);
+    let mut progress = ctx.printer.spinner("Scanning");
+    let files = scan::large_files(&root, min, depth, &mut |seen, path| {
+        progress.done_count(seen);
+        progress.tick(&format::tilde(path));
+    });
+    progress.finish();
+
     let shown = take(&files, top);
 
     if ctx.json {
@@ -336,29 +392,250 @@ fn files(ctx: &Ctx, min: u64, top: usize, path: Option<PathBuf>, depth: usize) -
 
     let p = &ctx.printer;
     p.heading(&format!(
-        "Fichiers ≥ {} dans {} ({} — {})",
+        "Files ≥ {} in {} ({} — {})",
         format::size(min),
         format::tilde(&root),
         files.len(),
         format::size(scan::total(&files))
     ));
     if files.is_empty() {
-        p.item(p.dim("aucun fichier ne dépasse cette taille"));
+        p.item(p.dim("no file is that big"));
         return true;
     }
     for file in shown {
         p.info(format!("  {:>10}  {}", format::size(file.bytes), file.name));
     }
     if shown.len() < files.len() {
-        p.info(p.dim(&format!("  … et {} autre(s)", files.len() - shown.len())));
+        p.info(p.dim(&format!("  … and {} more", files.len() - shown.len())));
     }
     true
 }
 
-// ── mémoire ─────────────────────────────────────────────────────────────────
+// ── build residue ───────────────────────────────────────────────────────────
 
-fn ram(ctx: &Ctx, top: usize, all: bool, detail: bool, min: u64) -> bool {
-    let snapshot = ram::snapshot(all);
+fn dev_residue(ctx: &Ctx, filter: &DevFilter, top: usize, remove: Option<bool>) -> bool {
+    let p = &ctx.printer;
+    let root = filter.path.clone().unwrap_or_else(fsx::home);
+
+    if !root.is_dir() {
+        p.error(format!("{} is not a directory", root.display()));
+        return false;
+    }
+
+    let unknown: Vec<&str> = filter
+        .lang
+        .iter()
+        .map(String::as_str)
+        .filter(|wanted| {
+            !dev::languages()
+                .iter()
+                .any(|known| known.eq_ignore_ascii_case(wanted))
+        })
+        .collect();
+    if !unknown.is_empty() {
+        p.error(format!(
+            "unknown language: {} — known: {}",
+            unknown.join(", "),
+            dev::languages().join(", ")
+        ));
+        return false;
+    }
+
+    let criteria = dev::Filter {
+        root: root.clone(),
+        max_depth: filter.depth,
+        min_age_days: filter.older_than,
+        languages: filter.lang.clone(),
+    };
+
+    let mut walk = p.spinner("Looking for projects");
+    let mut seen = 0usize;
+    let mut residue = dev::candidates(&criteria, &mut |dir| {
+        seen += 1;
+        walk.done_count(seen);
+        walk.tick(&format::tilde(dir));
+    });
+    walk.finish();
+
+    let mut sizing = p.bar("Measuring", residue.len());
+    for entry in &mut residue {
+        sizing.tick(&format::tilde(&entry.project));
+        dev::measure(entry);
+        sizing.advance(&format::tilde(&entry.project));
+    }
+    sizing.finish();
+    residue.sort_by_key(|entry| std::cmp::Reverse(entry.bytes));
+
+    let total = dev::total(&residue);
+
+    let Some(native) = remove else {
+        let shown = take(&residue, top);
+
+        if ctx.json {
+            emit(json!({
+                "root": root,
+                "older_than_days": filter.older_than,
+                "count": residue.len(),
+                "total": total,
+                "residue": shown,
+            }));
+            return true;
+        }
+
+        p.heading(&format!(
+            "Build residue in {} — untouched for {} day(s) ({} director{}, {})",
+            format::tilde(&root),
+            filter.older_than,
+            residue.len(),
+            if residue.len() == 1 { "y" } else { "ies" },
+            format::size(total)
+        ));
+        if residue.is_empty() {
+            p.item(p.dim("nothing to reclaim"));
+            return true;
+        }
+        for entry in shown {
+            render_residue(p, entry);
+        }
+        if shown.len() < residue.len() {
+            p.info(p.dim(&format!(
+                "  … and {} smaller director{}",
+                residue.len() - shown.len(),
+                if residue.len() - shown.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            )));
+        }
+        p.info("");
+        p.info(p.dim("  detox-mac files clean   removes them (your next build rebuilds them)"));
+        return true;
+    };
+
+    if residue.is_empty() {
+        if ctx.json {
+            emit(json!({ "removed": [], "freed": 0 }));
+        } else {
+            p.info("");
+            p.skipped("No build residue to remove.");
+        }
+        return true;
+    }
+
+    if !ctx.json {
+        p.heading(&format!(
+            "{} regenerable director{}, {} — untouched for {} day(s)",
+            residue.len(),
+            if residue.len() == 1 { "y" } else { "ies" },
+            format::size(total),
+            filter.older_than
+        ));
+        for entry in residue.iter().take(15) {
+            render_residue(p, entry);
+            if native {
+                if let Some(command) = dev::planned_command(entry) {
+                    p.item(p.dim(&format!("via {command}")));
+                }
+            }
+        }
+        if residue.len() > 15 {
+            p.info(p.dim(&format!("  … and {} more", residue.len() - 15)));
+        }
+    }
+
+    if !ctx.confirm(&format!(
+        "Remove {} director{} ({})?",
+        residue.len(),
+        if residue.len() == 1 { "y" } else { "ies" },
+        format::size(total)
+    )) {
+        if !ctx.json {
+            p.info("Cancelled.");
+        }
+        return false;
+    }
+
+    let mut progress = p.bar("Removing", residue.len());
+    let removed: Vec<dev::Removed> = residue
+        .iter()
+        .map(|entry| {
+            progress.tick(&format::tilde(&entry.project));
+            let outcome = dev::remove_one(entry, native, ctx);
+            progress.advance(&format::tilde(&entry.project));
+            outcome
+        })
+        .collect();
+    progress.finish();
+
+    let freed: u64 = removed.iter().map(|entry| entry.bytes).sum();
+    let failed = removed.iter().filter(|entry| entry.error.is_some()).count();
+
+    if ctx.json {
+        emit(json!({ "dry_run": ctx.dry_run, "freed": freed, "removed": removed }));
+        return failed == 0;
+    }
+
+    p.info("");
+    let summary = format!(
+        "{} director{} removed, {} freed",
+        removed.len() - failed,
+        if removed.len() - failed == 1 {
+            "y"
+        } else {
+            "ies"
+        },
+        format::size(freed)
+    );
+    if ctx.dry_run {
+        p.success(format!("{summary} [dry run]"));
+    } else {
+        p.success(summary);
+    }
+
+    for entry in &removed {
+        let detail = match (&entry.command, entry.method) {
+            (Some(command), dev::Method::Toolchain) => command.clone(),
+            (Some(command), dev::Method::ToolchainThenRemoved) => {
+                format!("{command}, then removed the leftovers")
+            }
+            _ => continue,
+        };
+        p.item(p.dim(&format!("{} — {detail}", format::tilde(&entry.path))));
+    }
+    for entry in removed.iter().filter(|entry| entry.error.is_some()) {
+        p.error(format!(
+            "{}: {}",
+            format::tilde(&entry.path),
+            entry.error.clone().unwrap_or_default()
+        ));
+    }
+    failed == 0
+}
+
+fn render_residue(p: &Printer, residue: &dev::Residue) {
+    p.info(format!(
+        "  {:>10}  {:<16} {:<40} {}",
+        format::size(residue.bytes),
+        residue.kind,
+        format::truncate_start(&format::tilde(&residue.project), 40),
+        p.dim(&format!("{} · {}d", residue.language, residue.age_days))
+    ));
+}
+
+// ── memory ──────────────────────────────────────────────────────────────────
+
+/// Takes a snapshot while showing a spinner, since it takes about a second.
+fn memory_snapshot(ctx: &Ctx, include_system: bool) -> ram::Snapshot {
+    let mut progress = ctx.printer.spinner("Reading processes");
+    progress.tick("ps, top, launchd");
+    let snapshot = ram::snapshot(include_system);
+    progress.finish();
+    snapshot
+}
+
+fn memory(ctx: &Ctx, top: usize, all: bool, detail: bool, min: u64) -> bool {
+    let snapshot = memory_snapshot(ctx, all);
     let groups: Vec<&ram::Group> = snapshot
         .groups
         .iter()
@@ -382,11 +659,11 @@ fn ram(ctx: &Ctx, top: usize, all: bool, detail: bool, min: u64) -> bool {
     let p = &ctx.printer;
     let memory = &snapshot.memory;
 
-    p.heading("Mémoire");
+    p.heading("Memory");
     p.field(
-        "Physique",
+        "Physical",
         format!(
-            "{} — {} utilisée, {} libre, {} inactive",
+            "{} — {} used, {} free, {} inactive",
             format::size(memory.total),
             format::size(memory.used),
             format::size(memory.free),
@@ -397,34 +674,34 @@ fn ram(ctx: &Ctx, top: usize, all: bool, detail: bool, min: u64) -> bool {
         p.field(
             "Swap",
             format!(
-                "{} utilisé sur {}",
+                "{} used of {}",
                 format::size(snapshot.swap.used),
                 format::size(snapshot.swap.total)
             ),
         );
     }
     if let Some(free) = snapshot.free_percent {
-        p.field("Pression", format!("{free} % de mémoire libre"));
+        p.field("Pressure", format!("{free}% of memory free"));
     }
 
     p.heading(&format!(
-        "{} ({} groupe(s) — {})",
+        "{} ({} group(s) — {})",
         if all {
-            "Tous les processus"
+            "All processes"
         } else {
-            "Processus hors macOS"
+            "Processes outside macOS"
         },
         groups.len(),
-        format::size(groups.iter().map(|g| g.bytes).sum::<u64>())
+        format::size(groups.iter().map(|group| group.bytes).sum::<u64>())
     ));
 
     for (index, group) in shown.iter().enumerate() {
         let mut tags = Vec::new();
         if group.autostart {
-            tags.push("démarrage auto".to_string());
+            tags.push("starts at login".to_string());
         }
         if group.system {
-            tags.push("système".to_string());
+            tags.push("system".to_string());
         }
         tags.push(format!("{} proc.", group.processes.len()));
 
@@ -447,7 +724,7 @@ fn ram(ctx: &Ctx, top: usize, all: bool, detail: bool, min: u64) -> bool {
             }
             if group.processes.len() > DETAIL_LIMIT {
                 p.info(p.dim(&format!(
-                    "                   … et {} processus plus petits",
+                    "                   … and {} smaller processes",
                     group.processes.len() - DETAIL_LIMIT
                 )));
             }
@@ -456,43 +733,44 @@ fn ram(ctx: &Ctx, top: usize, all: bool, detail: bool, min: u64) -> bool {
 
     if shown.len() < groups.len() {
         p.info(p.dim(&format!(
-            "  … et {} groupe(s) de moins de {}",
+            "  … and {} group(s) below {}",
             groups.len() - shown.len(),
-            format::size(shown.last().map_or(0, |g| g.bytes))
+            format::size(shown.last().map_or(0, |group| group.bytes))
         )));
     }
 
     if snapshot.hidden_groups > 0 {
         p.info("");
         p.info(p.dim(&format!(
-            "  {} composant(s) macOS/Apple masqué(s) ({}) — voir --all",
+            "  {} macOS/Apple component(s) hidden ({}) — see --all",
             snapshot.hidden_groups,
             format::size(snapshot.hidden_bytes)
         )));
     }
-    ram::remember(shown);
+
     p.info("");
-    p.info(p.dim("  detox-mac inspect <numéro|nom>   détaille les processus d'une application"));
-    p.info(p.dim("  detox-mac kill <numéro|nom>      arrête tous les processus d'une application"));
+    p.info(p.dim("  detox-mac inspect <number|name>   detail the processes of one application"));
+    p.info(p.dim("  detox-mac kill <number|name>      stop every process of one application"));
     if shown.iter().any(|group| group.autostart) {
         p.info(p.dim(
-            "  « démarrage auto » = lancé par un agent launchd ; detox-mac agents disable <label>",
+            "  \"starts at login\" = launched by a launchd agent; detox-mac agents disable <label>",
         ));
     }
 
+    ram::remember(shown);
     true
 }
 
-// ── désignation d'une application ───────────────────────────────────────────
+// ── naming an application ───────────────────────────────────────────────────
 
-/// Traduit un numéro affiché par `ram` en nom d'application.
+/// Turns a number printed by `ram` back into an application name.
 fn target_query(p: &Printer, raw: &str) -> Option<String> {
     match raw.trim().parse::<usize>() {
         Ok(index) => match ram::recall(index) {
             Some(name) => Some(name),
             None => {
                 p.error(format!(
-                    "aucun groupe n° {index} en mémoire — lancez d'abord detox-mac ram"
+                    "no group #{index} in memory — run detox-mac ram first"
                 ));
                 None
             }
@@ -501,26 +779,26 @@ fn target_query(p: &Printer, raw: &str) -> Option<String> {
     }
 }
 
-/// Retrouve le groupe visé, en expliquant l'échec le cas échéant.
+/// Finds the targeted group, explaining any failure.
 fn locate<'a>(p: &Printer, snapshot: &'a ram::Snapshot, query: &str) -> Option<&'a ram::Group> {
     match ram::find(&snapshot.groups, query) {
         ram::Lookup::One(group) => Some(group),
         ram::Lookup::Ambiguous(names) => {
-            p.error(format!("« {query} » correspond à plusieurs applications :"));
+            p.error(format!("`{query}` matches several applications:"));
             for name in names {
                 p.item(name);
             }
-            p.item(p.dim("précisez le nom, ou utilisez le numéro affiché par detox-mac ram"));
+            p.item(p.dim("narrow the name, or use the number shown by detox-mac ram"));
             None
         }
         ram::Lookup::None => {
-            p.error(format!("aucune application nommée « {query} » ne tourne."));
+            p.error(format!("no running application named `{query}`."));
             None
         }
     }
 }
 
-// ── détail d'une application ────────────────────────────────────────────────
+// ── detail of one application ───────────────────────────────────────────────
 
 fn inspect(ctx: &Ctx, raw_query: &str, short: bool) -> bool {
     let p = &ctx.printer;
@@ -528,7 +806,7 @@ fn inspect(ctx: &Ctx, raw_query: &str, short: bool) -> bool {
         return false;
     };
 
-    let snapshot = ram::snapshot(true);
+    let snapshot = memory_snapshot(ctx, true);
     let Some(group) = locate(p, &snapshot, &query) else {
         return false;
     };
@@ -548,25 +826,22 @@ fn inspect(ctx: &Ctx, raw_query: &str, short: bool) -> bool {
         p.field("Bundle", format::tilde(bundle));
     }
     p.field(
-        "Mémoire",
+        "Memory",
         format!(
-            "{} — {} processus",
+            "{} — {} processes",
             format::size(group.bytes),
             group.processes.len()
         ),
     );
-    p.field(
-        "CPU moyen",
-        format!("{cpu:.1} % (moyenne depuis le lancement)"),
-    );
+    p.field("CPU", format!("{cpu:.1}% (average since launch)"));
     if let Some(process) = group.processes.first() {
-        p.field("Utilisateur", &process.user);
+        p.field("User", &process.user);
     }
     if !group.agents.is_empty() {
-        p.field("Démarrage auto", group.agents.join(", "));
+        p.field("Starts at login", group.agents.join(", "));
     }
     if group.system {
-        p.field("Origine", "composant macOS / Apple");
+        p.field("Origin", "macOS / Apple component");
     }
 
     p.info("");
@@ -578,14 +853,14 @@ fn inspect(ctx: &Ctx, raw_query: &str, short: bool) -> bool {
     if !group.agents.is_empty() {
         p.info("");
         p.info(p.dim(&format!(
-            "  detox-mac agents disable {}   empêche le lancement automatique",
+            "  detox-mac agents disable {}   stops it from starting on its own",
             group.agents[0]
         )));
     }
     true
 }
 
-/// Affiche un processus et sa descendance à l'intérieur du groupe.
+/// Renders a process and its descendants inside the group.
 fn render_process(
     p: &Printer,
     process: &ram::Process,
@@ -605,13 +880,13 @@ fn render_process(
         "{head}{}{}",
         " ".repeat(padding),
         p.dim(&format!(
-            "{:>5.1} % · {}",
+            "{:>5.1}% · {}",
             process.cpu,
             format::elapsed(&process.elapsed)
         ))
     ));
 
-    // La branche se prolonge sous les enfants, sauf après le dernier d'entre eux.
+    // The branch keeps going under every child but the last one.
     let continuation = match connector.chars().next() {
         None => "  ",
         Some('└') => "   ",
@@ -643,7 +918,7 @@ fn render_process(
     }
 }
 
-/// Arguments du processus, sans l'exécutable lui-même.
+/// Arguments of a process, without the executable itself.
 fn process_arguments(process: &ram::Process) -> Option<String> {
     let full = process.args.as_deref()?;
     let rest = full
@@ -655,24 +930,24 @@ fn process_arguments(process: &ram::Process) -> Option<String> {
     (!rest.is_empty()).then(|| rest.to_string())
 }
 
-// ── arrêt d'une application ─────────────────────────────────────────────────
+// ── stopping an application ─────────────────────────────────────────────────
 
 fn kill(ctx: &Ctx, query: &str, force: bool, allow_system: bool) -> bool {
     let p = &ctx.printer;
 
-    // Un numéro renvoie au nom affiché lors du dernier `detox-mac ram`.
+    // A number refers to the name shown by the last `detox-mac ram`.
     let Some(query) = target_query(p, query) else {
         return false;
     };
 
-    let snapshot = ram::snapshot(true);
+    let snapshot = memory_snapshot(ctx, true);
     let Some(group) = locate(p, &snapshot, &query) else {
         return false;
     };
 
     if group.system && !allow_system {
         p.error(format!(
-            "{} est un composant de macOS — ajoutez --system pour l'arrêter quand même.",
+            "{} is a macOS component — pass --system to stop it anyway.",
             group.name
         ));
         return false;
@@ -686,7 +961,7 @@ fn kill(ctx: &Ctx, query: &str, force: bool, allow_system: bool) -> bool {
 
     if !ctx.json {
         p.heading(&format!(
-            "{} — {} processus, {}",
+            "{} — {} processes, {}",
             group.name,
             group.processes.len(),
             format::size(group.bytes)
@@ -700,26 +975,28 @@ fn kill(ctx: &Ctx, query: &str, force: bool, allow_system: bool) -> bool {
         }
         if group.processes.len() > 8 {
             p.info(p.dim(&format!(
-                "  … et {} processus plus petits",
+                "  … and {} smaller processes",
                 group.processes.len() - 8
             )));
         }
     }
 
     if suicidal {
-        p.warn("ce groupe contient le terminal qui exécute detox-mac : la commande sera interrompue en même temps.");
+        p.warn(
+            "this group holds the terminal running detox-mac: the command will be cut short too.",
+        );
     }
     if force {
-        p.warn("SIGKILL : les applications n'auront pas la possibilité d'enregistrer.");
+        p.warn("SIGKILL: applications get no chance to save.");
     }
 
     if !ctx.confirm(&format!(
-        "Arrêter {} ({} processus) ?",
+        "Stop {} ({} processes)?",
         group.name,
         group.processes.len()
     )) {
         if !ctx.json {
-            p.info("Annulé.");
+            p.info("Cancelled.");
         }
         return false;
     }
@@ -733,16 +1010,16 @@ fn kill(ctx: &Ctx, query: &str, force: bool, allow_system: bool) -> bool {
 
     p.info("");
     if report.terminated.is_empty() {
-        p.error(format!("{} — aucun processus arrêté", report.group));
+        p.error(format!("{} — no process stopped", report.group));
     } else {
         let summary = format!(
-            "{} — {} processus arrêté(s), {} libéré(s)",
+            "{} — {} process(es) stopped, {} freed",
             report.group,
             report.terminated.len(),
             format::size(report.bytes)
         );
         if ctx.dry_run {
-            p.success(format!("{summary} [simulation]"));
+            p.success(format!("{summary} [dry run]"));
         } else {
             p.success(summary);
         }
@@ -753,7 +1030,7 @@ fn kill(ctx: &Ctx, query: &str, force: bool, allow_system: bool) -> bool {
     }
     if !report.survived.is_empty() {
         p.warn(format!(
-            "{} processus toujours vivants : {} — réessayez avec --force",
+            "{} process(es) still alive: {} — try again with --force",
             report.survived.len(),
             report
                 .survived
@@ -773,8 +1050,8 @@ fn list_agents(ctx: &Ctx, third_party_only: bool, scope: Option<Scope>) -> bool 
     let all = agents::collect();
     let selected: Vec<&Agent> = all
         .iter()
-        .filter(|a| !third_party_only || !a.apple)
-        .filter(|a| scope.is_none_or(|s| a.scope == s))
+        .filter(|agent| !third_party_only || !agent.apple)
+        .filter(|agent| scope.is_none_or(|wanted| agent.scope == wanted))
         .collect();
 
     if ctx.json {
@@ -784,14 +1061,17 @@ fn list_agents(ctx: &Ctx, third_party_only: bool, scope: Option<Scope>) -> bool 
 
     let p = &ctx.printer;
     for scope in Scope::ALL {
-        let group: Vec<&&Agent> = selected.iter().filter(|a| a.scope == scope).collect();
+        let group: Vec<&&Agent> = selected
+            .iter()
+            .filter(|agent| agent.scope == scope)
+            .collect();
         if group.is_empty() {
             continue;
         }
         p.heading(scope.label());
         for agent in group {
-            let origin = if agent.apple { "Apple" } else { "tiers" };
-            let state = if agent.loaded { "actif" } else { "inactif" };
+            let origin = if agent.apple { "Apple" } else { "third-party" };
+            let state = if agent.loaded { "loaded" } else { "not loaded" };
             p.info(format!(
                 "  {:<52} {}",
                 agent.label,
@@ -802,7 +1082,9 @@ fn list_agents(ctx: &Ctx, third_party_only: bool, scope: Option<Scope>) -> bool 
 
     let (apple, third_party) = agents::summary(&all);
     p.info("");
-    p.info(format!("  {third_party} agent(s) tiers, {apple} Apple"));
+    p.info(format!(
+        "  {third_party} third-party agent(s), {apple} Apple"
+    ));
     true
 }
 
@@ -812,13 +1094,13 @@ fn act_on_agents(ctx: &Ctx, action: Action, selection: Selection) -> bool {
     let mut unknown = Vec::new();
     let selected: Vec<&Agent> = if selection.all_third_party {
         all.iter()
-            .filter(|a| !a.apple)
-            .filter(|a| selection.scope.is_none_or(|s| a.scope == s))
+            .filter(|agent| !agent.apple)
+            .filter(|agent| selection.scope.is_none_or(|wanted| agent.scope == wanted))
             .collect()
     } else {
         let mut found = Vec::new();
         for label in &selection.labels {
-            match all.iter().find(|a| &a.label == label) {
+            match all.iter().find(|agent| &agent.label == label) {
                 Some(agent) => found.push(agent),
                 None => unknown.push(label.clone()),
             }
@@ -827,59 +1109,69 @@ fn act_on_agents(ctx: &Ctx, action: Action, selection: Selection) -> bool {
     };
 
     for label in &unknown {
-        ctx.printer.warn(format!("agent introuvable : {label}"));
+        ctx.printer.warn(format!("unknown agent: {label}"));
     }
 
     if selected.is_empty() {
-        ctx.printer.error("aucun agent correspondant.");
+        ctx.printer.error("no matching agent.");
         return false;
     }
 
-    let apple_count = selected.iter().filter(|a| a.apple).count();
+    let apple_count = selected.iter().filter(|agent| agent.apple).count();
     if apple_count > 0 {
         ctx.printer.warn(format!(
-            "{apple_count} agent(s) Apple ignoré(s) : detox-mac ne touche pas aux composants système."
+            "{apple_count} Apple agent(s) skipped: detox-mac never touches system components."
         ));
     }
 
     let verb = match action {
-        Action::Disable => "Désactiver",
-        Action::Enable => "Réactiver",
-        Action::Remove => "Supprimer définitivement",
+        Action::Disable => "Disable",
+        Action::Enable => "Enable",
+        Action::Remove => "Permanently remove",
     };
-    if !ctx.confirm(&format!("{verb} {} agent(s) ?", selected.len())) {
+    if !ctx.confirm(&format!("{verb} {} agent(s)?", selected.len())) {
         if !ctx.json {
-            ctx.printer.info("Annulé.");
+            ctx.printer.info("Cancelled.");
         }
         return false;
     }
 
+    let mut progress = ctx.printer.bar("Applying", selected.len());
     let outcomes: Vec<Outcome> = selected
         .iter()
-        .map(|agent| agents::apply(agent, action, ctx))
+        .map(|agent| {
+            progress.tick(&agent.label);
+            let outcome = agents::apply(agent, action, ctx);
+            progress.advance(&agent.label);
+            outcome
+        })
         .collect();
+    progress.finish();
+
     render_outcomes(ctx, &outcomes)
 }
 
-// ── système ─────────────────────────────────────────────────────────────────
+// ── system ──────────────────────────────────────────────────────────────────
 
 fn sys(ctx: &Ctx, command: SysCommand) -> bool {
     let needs_confirmation = !matches!(command, SysCommand::Updates);
     let question = match command {
-        SysCommand::Dns => "Vider le cache DNS ?",
-        SysCommand::Spotlight => "Réinitialiser l'index Spotlight ?",
-        SysCommand::Memory => "Libérer la mémoire inactive ?",
-        SysCommand::Snapshots => "Purger les instantanés Time Machine locaux ?",
+        SysCommand::Dns => "Flush the DNS cache?",
+        SysCommand::Spotlight => "Rebuild the Spotlight index?",
+        SysCommand::Memory => "Free inactive memory?",
+        SysCommand::Snapshots => "Purge local Time Machine snapshots?",
         SysCommand::Updates => "",
     };
 
     if needs_confirmation && !ctx.confirm(question) {
         if !ctx.json {
-            ctx.printer.info("Annulé.");
+            ctx.printer.info("Cancelled.");
         }
         return false;
     }
 
+    let mut progress = ctx.printer.spinner("Working");
+    progress.tick(question.trim_end_matches('?'));
     let outcome = match command {
         SysCommand::Dns => maintenance::flush_dns(ctx),
         SysCommand::Spotlight => maintenance::reindex_spotlight(ctx),
@@ -887,12 +1179,13 @@ fn sys(ctx: &Ctx, command: SysCommand) -> bool {
         SysCommand::Snapshots => maintenance::thin_snapshots(ctx),
         SysCommand::Updates => maintenance::check_updates(),
     };
+    progress.finish();
 
     render_outcomes(ctx, std::slice::from_ref(&outcome))
 }
 
 fn render_outcomes(ctx: &Ctx, outcomes: &[Outcome]) -> bool {
-    let failed = outcomes.iter().any(|o| o.status.is_failure());
+    let failed = outcomes.iter().any(|outcome| outcome.status.is_failure());
 
     if ctx.json {
         emit(json!({ "dry_run": ctx.dry_run, "results": outcomes }));

@@ -1,25 +1,25 @@
-//! Utilitaires de système de fichiers.
+//! Filesystem helpers.
 //!
-//! Toutes les fonctions destructives prennent un indicateur `dry_run` : en mode
-//! simulation, elles mesurent exactement ce qui serait supprimé sans rien toucher.
+//! Every destructive function takes a `dry_run` flag: in that mode it measures
+//! exactly what would be deleted without touching anything.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// Dossier personnel de l'utilisateur courant.
+/// Home directory of the current user.
 pub fn home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default()
 }
 
-/// Chemin dans le dossier personnel : `home_join("Library/Caches")`.
+/// Path inside the home directory: `home_join("Library/Caches")`.
 pub fn home_join(suffix: &str) -> PathBuf {
     home().join(suffix)
 }
 
-/// Taille d'une entrée, récursive pour un dossier. Les liens symboliques ne
-/// sont jamais suivis (leur taille propre est comptée).
+/// Size of an entry, recursive for a directory. Symlinks are never followed;
+/// only the link itself is counted.
 pub fn size_of(path: &Path) -> u64 {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return 0;
@@ -37,14 +37,14 @@ pub fn size_of(path: &Path) -> u64 {
     total
 }
 
-/// Résultat d'une suppression.
+/// Outcome of a deletion.
 #[derive(Debug, Default, Clone)]
 pub struct Removal {
-    /// Octets libérés (ou qui le seraient en simulation).
+    /// Bytes freed (or that would be, in dry-run mode).
     pub freed: u64,
-    /// Nombre d'entrées de premier niveau supprimées.
+    /// Number of top-level entries removed.
     pub removed: usize,
-    /// Entrées qui n'ont pas pu être supprimées.
+    /// Entries that could not be removed.
     pub errors: Vec<String>,
 }
 
@@ -56,7 +56,7 @@ impl Removal {
     }
 }
 
-/// Supprime une entrée (fichier, lien ou dossier) sans suivre les liens.
+/// Removes an entry (file, link or directory) without following symlinks.
 pub fn remove(path: &Path, dry_run: bool) -> std::io::Result<()> {
     if dry_run {
         return Ok(());
@@ -69,7 +69,7 @@ pub fn remove(path: &Path, dry_run: bool) -> std::io::Result<()> {
     }
 }
 
-/// Vide le contenu d'un dossier sans supprimer le dossier lui-même.
+/// Empties a directory without removing the directory itself.
 pub fn empty_dir(path: &Path, dry_run: bool) -> Removal {
     let mut result = Removal::default();
 
@@ -87,14 +87,14 @@ pub fn empty_dir(path: &Path, dry_run: bool) -> Removal {
             }
             Err(err) => result
                 .errors
-                .push(format!("{} : {err}", crate::format::tilde(&entry_path))),
+                .push(format!("{}: {err}", crate::format::tilde(&entry_path))),
         }
     }
 
     result
 }
 
-/// Dossiers ignorés lors des parcours de l'arborescence personnelle.
+/// Directories skipped when walking the home tree.
 const SKIPPED_DIRS: &[&str] = &[
     "Library",
     "node_modules",
@@ -105,10 +105,10 @@ const SKIPPED_DIRS: &[&str] = &[
     "Applications",
 ];
 
-/// Parcourt `root` en profondeur en appelant `visit` pour chaque fichier.
+/// Walks `root` depth-first, calling `visit` for every file.
 ///
-/// Les liens symboliques ne sont pas suivis, les dossiers système et les caches
-/// de gestionnaires de paquets sont ignorés, et la profondeur est bornée.
+/// Symlinks are not followed, system and package-manager directories are
+/// skipped, and the depth is bounded.
 pub fn walk_files(root: &Path, max_depth: usize, visit: &mut impl FnMut(&Path, u64)) {
     fn inner(dir: &Path, depth: usize, max_depth: usize, visit: &mut impl FnMut(&Path, u64)) {
         if depth > max_depth {
@@ -143,7 +143,7 @@ pub fn walk_files(root: &Path, max_depth: usize, visit: &mut impl FnMut(&Path, u
     inner(root, 0, max_depth, visit);
 }
 
-/// Liste les fichiers `.plist` d'un dossier, triés par nom.
+/// Lists the `.plist` files of a directory, sorted by name.
 pub fn plists(dir: &Path) -> Vec<PathBuf> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();

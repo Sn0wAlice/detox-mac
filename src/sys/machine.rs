@@ -1,4 +1,4 @@
-//! Collecte des informations système (macOS).
+//! Machine information (macOS).
 
 use serde::Serialize;
 
@@ -25,7 +25,7 @@ pub struct Memory {
     pub inactive: u64,
 }
 
-/// Utilisation du fichier d'échange.
+/// Swap file usage.
 #[derive(Debug, Default, Clone, Serialize)]
 pub struct Swap {
     pub total: u64,
@@ -33,7 +33,7 @@ pub struct Swap {
 }
 
 impl Swap {
-    /// Lit `vm.swapusage` : `total = 4096.00M  used = 2520.88M  free = 1575.12M`.
+    /// Reads `vm.swapusage`: `total = 4096.00M  used = 2520.88M  free = 1575.12M`.
     pub fn collect() -> Self {
         let Some(raw) = cmd::sysctl("vm.swapusage") else {
             return Self::default();
@@ -54,7 +54,7 @@ impl Swap {
     }
 }
 
-/// Analyse une taille de `vm.swapusage` : `4096.00M`, `1.50G`.
+/// Parses a `vm.swapusage` size: `4096.00M`, `1.50G`.
 fn parse_swap_size(input: &str) -> Option<u64> {
     let split = input.find(|c: char| !c.is_ascii_digit() && c != '.')?;
     let (number, unit) = input.split_at(split);
@@ -80,7 +80,7 @@ pub struct Disk {
 }
 
 impl Machine {
-    /// Rassemble toutes les informations disponibles.
+    /// Gathers everything that is available.
     pub fn collect() -> Self {
         let (os, build) = os_version();
         Self {
@@ -101,7 +101,7 @@ impl Machine {
     }
 }
 
-/// Nom + version de macOS, et numéro de build.
+/// macOS name + version, and build number.
 fn os_version() -> (String, String) {
     let Ok(output) = cmd::run("sw_vers", &[] as &[&str]) else {
         return (String::new(), String::new());
@@ -133,10 +133,12 @@ fn uptime() -> String {
         .split("up ")
         .nth(1)
         .map(|rest| {
+            // `uptime` pads its fields, so collapse the runs of spaces.
             rest.split(',')
                 .take(2)
+                .map(|part| part.split_whitespace().collect::<Vec<_>>().join(" "))
                 .collect::<Vec<_>>()
-                .join(",")
+                .join(", ")
                 .trim()
                 .to_string()
         })
@@ -192,7 +194,7 @@ impl Memory {
 
 impl Disk {
     fn collect(mount: &str) -> Option<Self> {
-        // `df -k` renvoie des blocs de 1 Ko, indépendamment de la locale.
+        // `df -k` reports 1 KB blocks, whatever the locale.
         let output = cmd::run("df", &["-k", mount]).ok()?;
         let line = output.stdout.lines().nth(1)?;
         let fields: Vec<&str> = line.split_whitespace().collect();

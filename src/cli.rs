@@ -1,4 +1,4 @@
-//! Définition de la ligne de commande.
+//! Command-line definition.
 
 use std::path::PathBuf;
 
@@ -9,7 +9,7 @@ use crate::task::agents::Scope;
 use crate::task::clean::Target;
 use crate::ui::ColorChoice;
 
-/// Outil de maintenance macOS : nettoyage, diagnostic et agents de démarrage.
+/// macOS maintenance tool: cleanup, diagnostics and startup agents.
 #[derive(Debug, Parser)]
 #[command(
     name = "detox-mac",
@@ -27,58 +27,58 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// Options valables pour toutes les sous-commandes.
+/// Options valid for every subcommand.
 #[derive(Debug, Args)]
 pub struct Options {
-    /// Ne rien modifier : mesure et affiche ce qui serait fait.
+    /// Change nothing: measure and show what would be done.
     #[arg(short = 'n', long, global = true)]
     pub dry_run: bool,
 
-    /// Répondre oui à toutes les confirmations.
+    /// Answer yes to every confirmation.
     #[arg(short = 'y', long, global = true)]
     pub yes: bool,
 
-    /// N'afficher que les avertissements et les erreurs.
+    /// Print warnings and errors only.
     #[arg(short, long, global = true, conflicts_with = "json")]
     pub quiet: bool,
 
-    /// Sortie JSON, pour les scripts.
+    /// JSON output, for scripts.
     #[arg(long, global = true)]
     pub json: bool,
 
-    /// Coloration de la sortie.
-    #[arg(long, global = true, value_name = "QUAND", default_value = "auto")]
+    /// When to colourise the output.
+    #[arg(long, global = true, value_name = "WHEN", default_value = "auto")]
     pub color: ColorChoice,
 }
 
-/// Cible acceptée sur la ligne de commande : une zone précise, ou `all`.
+/// A cleaning target as accepted on the command line, or `all`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum TargetArg {
-    /// Toutes les cibles, sauf les simulateurs iOS (à demander explicitement).
+    /// Every target except the iOS simulators, which must be asked for.
     All,
-    /// Caches utilisateur (`~/Library/Caches`).
+    /// User caches (`~/Library/Caches`).
     Cache,
-    /// Corbeille utilisateur (`~/.Trash`).
+    /// User trash (`~/.Trash`).
     Trash,
-    /// Corbeille utilisateur + corbeilles des volumes montés.
+    /// User trash plus the trash of every mounted volume.
     TrashAll,
-    /// Journaux utilisateur (`~/Library/Logs`).
+    /// User logs (`~/Library/Logs`).
     Logs,
-    /// Fichiers `.DS_Store` du dossier personnel.
+    /// `.DS_Store` files in the home directory.
     DsStore,
-    /// Cache de téléchargement Homebrew.
+    /// Homebrew download cache.
     Homebrew,
-    /// Docker : conteneurs, images et caches de build inutilisés.
+    /// Docker: unused containers, images and build caches.
     Docker,
-    /// Données Xcode : DerivedData, DeviceSupport, caches du simulateur.
+    /// Xcode data: DerivedData, DeviceSupport, simulator caches.
     Xcode,
-    /// Appareils du simulateur iOS.
+    /// iOS simulator devices.
     Simulators,
 }
 
 impl TargetArg {
-    /// Cible concrète, ou `None` pour `all`.
+    /// The concrete target, or `None` for `all`.
     fn target(self) -> Option<Target> {
         match self {
             TargetArg::All => None,
@@ -94,7 +94,7 @@ impl TargetArg {
         }
     }
 
-    /// Développe les arguments en cibles concrètes, sans doublon et dans l'ordre.
+    /// Expands the arguments into concrete targets, in order and without duplicates.
     pub fn expand(args: &[TargetArg]) -> Vec<Target> {
         fn push(targets: &mut Vec<Target>, target: Target) {
             if !targets.contains(&target) {
@@ -118,173 +118,223 @@ impl TargetArg {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Résumé de la machine et de l'espace récupérable.
+    /// Machine summary and reclaimable space.
     Info,
 
-    /// Mesurer l'espace récupérable, sans rien supprimer.
+    /// Measure reclaimable space without deleting anything.
     Scan {
-        /// Cibles à mesurer ; `all` pour tout mesurer (défaut : les plus rapides).
-        #[arg(value_name = "CIBLE")]
+        /// Targets to measure; `all` measures everything (default: the quick ones).
+        #[arg(value_name = "TARGET")]
         targets: Vec<TargetArg>,
     },
 
-    /// Nettoyer une ou plusieurs cibles ; `all` pour tout nettoyer d'un coup.
+    /// Clean one or more targets; `all` cleans everything at once.
     Clean {
-        /// Cibles à nettoyer, ou `all`.
-        #[arg(value_name = "CIBLE", required = true)]
+        /// Targets to clean, or `all`.
+        #[arg(value_name = "TARGET", required = true)]
         targets: Vec<TargetArg>,
     },
 
-    /// Lister les applications installées par taille.
+    /// List installed applications by size.
     Apps {
-        /// Nombre d'applications affichées (0 = toutes).
+        /// Number of applications shown (0 = all).
         #[arg(short, long, value_name = "N", default_value_t = 15)]
         top: usize,
     },
 
-    /// Rechercher les fichiers volumineux.
+    /// Explore files: large files and build residue.
     Files {
-        /// Taille minimale (ex. 500M, 1.5G).
-        #[arg(short, long, value_name = "TAILLE", default_value = "500M", value_parser = format::parse_size)]
-        min: u64,
-
-        /// Nombre de fichiers affichés (0 = tous).
-        #[arg(short, long, value_name = "N", default_value_t = 20)]
-        top: usize,
-
-        /// Dossier de départ (par défaut : le dossier personnel).
-        #[arg(short, long, value_name = "CHEMIN")]
-        path: Option<PathBuf>,
-
-        /// Profondeur maximale de parcours.
-        #[arg(short, long, value_name = "N", default_value_t = 8)]
-        depth: usize,
+        #[command(subcommand)]
+        command: FileCommand,
     },
 
-    /// Inspecter la mémoire vive, regroupée par application.
+    /// Inspect memory, grouped by application.
     Ram {
-        /// Nombre de groupes affichés (0 = tous).
+        /// Number of groups shown (0 = all).
         #[arg(short, long, value_name = "N", default_value_t = 15)]
         top: usize,
 
-        /// Inclure les processus de macOS et des applications Apple.
+        /// Include macOS and Apple processes.
         #[arg(short, long)]
         all: bool,
 
-        /// Détailler les processus de chaque groupe.
+        /// List the processes of every group.
         #[arg(short, long)]
         detail: bool,
 
-        /// Masquer les groupes en dessous de cette taille.
-        #[arg(short, long, value_name = "TAILLE", default_value = "0", value_parser = format::parse_size)]
+        /// Hide groups below this size.
+        #[arg(short, long, value_name = "SIZE", default_value = "0", value_parser = format::parse_size)]
         min: u64,
     },
 
-    /// Détailler les processus d'une application.
+    /// Detail the processes of one application.
     Inspect {
-        /// Nom de l'application, ou numéro affiché par `detox-mac ram`.
-        #[arg(value_name = "CIBLE", required = true, num_args = 1..)]
+        /// Application name, or the number shown by `detox-mac ram`.
+        #[arg(value_name = "TARGET", required = true, num_args = 1..)]
         target: Vec<String>,
 
-        /// Masquer les lignes de commande.
+        /// Hide command lines.
         #[arg(short, long)]
         short: bool,
     },
 
-    /// Arrêter tous les processus d'une application.
+    /// Stop every process of one application.
     Kill {
-        /// Nom de l'application, ou numéro affiché par `detox-mac ram`.
-        #[arg(value_name = "CIBLE", required = true, num_args = 1..)]
+        /// Application name, or the number shown by `detox-mac ram`.
+        #[arg(value_name = "TARGET", required = true, num_args = 1..)]
         target: Vec<String>,
 
-        /// Envoyer SIGKILL au lieu de SIGTERM (arrêt brutal, sans sauvegarde).
+        /// Send SIGKILL instead of SIGTERM (no chance to save).
         #[arg(short, long)]
         force: bool,
 
-        /// Autoriser à viser un composant de macOS ou une application Apple.
+        /// Allow targeting a macOS component or an Apple application.
         #[arg(long)]
         system: bool,
     },
 
-    /// Gérer les agents et démons de démarrage.
+    /// Manage startup agents and daemons.
     Agents {
         #[command(subcommand)]
         command: AgentCommand,
     },
 
-    /// Opérations système ponctuelles.
+    /// One-off system operations.
     Sys {
         #[command(subcommand)]
         command: SysCommand,
     },
 
-    /// Générer la complétion pour un shell.
+    /// Generate shell completions.
     Completions {
-        /// Shell cible.
+        /// Target shell.
         #[arg(value_name = "SHELL")]
         shell: clap_complete::Shell,
     },
 }
 
 #[derive(Debug, Subcommand)]
+pub enum FileCommand {
+    /// List the largest files.
+    Large {
+        /// Minimum size (e.g. 500M, 1.5G).
+        #[arg(short, long, value_name = "SIZE", default_value = "500M", value_parser = format::parse_size)]
+        min: u64,
+
+        /// Number of files shown (0 = all).
+        #[arg(short, long, value_name = "N", default_value_t = 20)]
+        top: usize,
+
+        /// Starting directory (default: the home directory).
+        #[arg(short, long, value_name = "PATH")]
+        path: Option<PathBuf>,
+
+        /// Maximum walk depth.
+        #[arg(short, long, value_name = "N", default_value_t = 8)]
+        depth: usize,
+    },
+
+    /// List the build residue of local projects (read only).
+    Dev {
+        #[command(flatten)]
+        filter: DevFilter,
+
+        /// Number of directories shown (0 = all).
+        #[arg(short, long, value_name = "N", default_value_t = 20)]
+        top: usize,
+    },
+
+    /// Delete the build residue of local projects.
+    Clean {
+        #[command(flatten)]
+        filter: DevFilter,
+
+        /// Use the language's own tool when it exists (`cargo clean`,
+        /// `swift package clean`…) instead of removing the directory.
+        #[arg(long)]
+        native: bool,
+    },
+}
+
+/// Which build residue to consider.
+#[derive(Debug, Args)]
+pub struct DevFilter {
+    /// Keep only what has not changed for N days.
+    #[arg(short = 'o', long, value_name = "DAYS", default_value_t = 7)]
+    pub older_than: u64,
+
+    /// Starting directory (default: the home directory).
+    #[arg(short, long, value_name = "PATH")]
+    pub path: Option<PathBuf>,
+
+    /// Maximum walk depth.
+    #[arg(short, long, value_name = "N", default_value_t = 8)]
+    pub depth: usize,
+
+    /// Restrict to some languages (rust, node, python…).
+    #[arg(short, long, value_name = "LANGUAGE", num_args = 1..)]
+    pub lang: Vec<String>,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum AgentCommand {
-    /// Lister les agents installés.
+    /// List installed agents.
     List {
-        /// N'afficher que les agents tiers.
+        /// Show third-party agents only.
         #[arg(short, long)]
         third_party: bool,
 
-        /// Restreindre à un emplacement.
-        #[arg(short, long, value_name = "EMPLACEMENT")]
+        /// Restrict to one location.
+        #[arg(short, long, value_name = "LOCATION")]
         scope: Option<Scope>,
     },
 
-    /// Désactiver des agents tiers (`launchctl unload`, sans suppression).
+    /// Disable third-party agents (`launchctl unload`, without deleting).
     Disable {
         #[command(flatten)]
         selection: Selection,
     },
 
-    /// Réactiver des agents tiers (`launchctl load`).
+    /// Re-enable third-party agents (`launchctl load`).
     Enable {
         #[command(flatten)]
         selection: Selection,
     },
 
-    /// Supprimer définitivement des agents tiers.
+    /// Permanently remove third-party agents.
     Remove {
         #[command(flatten)]
         selection: Selection,
     },
 }
 
-/// Sélection d'agents : labels explicites ou tous les agents tiers.
+/// Agent selection: explicit labels, or every third-party agent.
 #[derive(Debug, Args)]
 pub struct Selection {
-    /// Labels à traiter (ex. com.docker.helper).
+    /// Labels to act on (e.g. com.docker.helper).
     #[arg(value_name = "LABEL", required_unless_present = "all_third_party")]
     pub labels: Vec<String>,
 
-    /// Tous les agents tiers. Les agents Apple ne sont jamais touchés.
+    /// Every third-party agent. Apple agents are never touched.
     #[arg(long, conflicts_with = "labels")]
     pub all_third_party: bool,
 
-    /// Restreindre à un emplacement.
-    #[arg(short, long, value_name = "EMPLACEMENT")]
+    /// Restrict to one location.
+    #[arg(short, long, value_name = "LOCATION")]
     pub scope: Option<Scope>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum SysCommand {
-    /// Vider le cache DNS (sudo).
+    /// Flush the DNS cache (sudo).
     Dns,
-    /// Réinitialiser l'index Spotlight (sudo).
+    /// Rebuild the Spotlight index (sudo).
     Spotlight,
-    /// Libérer la mémoire inactive (sudo).
+    /// Free inactive memory (sudo).
     Memory,
-    /// Purger les instantanés Time Machine locaux.
+    /// Purge local Time Machine snapshots.
     Snapshots,
-    /// Lister les mises à jour macOS disponibles.
+    /// List available macOS updates.
     Updates,
 }
 

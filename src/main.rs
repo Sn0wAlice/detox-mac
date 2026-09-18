@@ -1,4 +1,4 @@
-//! `detox-mac` — maintenance macOS en ligne de commande.
+//! `detox-mac` — macOS maintenance from the command line.
 
 mod app;
 mod cli;
@@ -13,7 +13,7 @@ use clap::Parser;
 
 fn main() -> ExitCode {
     if cfg!(not(target_os = "macos")) {
-        eprintln!("detox-mac ne fonctionne que sur macOS.");
+        eprintln!("detox-mac only runs on macOS.");
         return ExitCode::FAILURE;
     }
 
