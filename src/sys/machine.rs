@@ -192,6 +192,14 @@ impl Memory {
     }
 }
 
+/// Free space on a mount, right now.
+///
+/// Read again after a cleanup, it is the only honest answer to "did that
+/// actually give me anything back?".
+pub fn free_space(mount: &str) -> Option<u64> {
+    Disk::collect(mount).map(|disk| disk.free)
+}
+
 impl Disk {
     fn collect(mount: &str) -> Option<Self> {
         // `df -k` reports 1 KB blocks, whatever the locale.

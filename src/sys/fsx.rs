@@ -14,9 +14,11 @@ use std::fs;
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use crate::config::Excludes;
 use crate::format;
+use crate::sys::par;
 
 /// Home directory of the current user.
 pub fn home() -> PathBuf {
@@ -84,23 +86,73 @@ fn occupied(meta: &fs::Metadata) -> u64 {
     meta.blocks().saturating_mul(512)
 }
 
+/// `SF_DATALESS`: the file belongs to iCloud and its content is not on this
+/// disk. Only macOS has the flag.
+#[cfg(target_os = "macos")]
+fn has_dataless_flag(meta: &fs::Metadata) -> bool {
+    use std::os::macos::fs::MetadataExt as MacMetadataExt;
+    const SF_DATALESS: u32 = 0x4000_0000;
+    meta.st_flags() & SF_DATALESS != 0
+}
+
+#[cfg(not(target_os = "macos"))]
+fn has_dataless_flag(_meta: &fs::Metadata) -> bool {
+    false
+}
+
+/// Whether a path is an iCloud placeholder rather than a real file.
+///
+/// It takes no space, so counting it would inflate every total — and deleting
+/// it would remove the real file from iCloud, on every device.
+pub fn is_evicted(path: &Path, meta: &fs::Metadata) -> bool {
+    if has_dataless_flag(meta) {
+        return true;
+    }
+    // The visible placeholder of an evicted file: `.name.ext.icloud`.
+    path.extension().is_some_and(|ext| ext == "icloud")
+        && path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+}
+
 /// Accumulates a measurement across one or more trees.
 ///
-/// Reusing one `Sizer` over several directories is what makes hard-link
-/// de-duplication work: a file linked from two of them is counted once.
+/// The set of already-counted inodes is shared, which is what makes hard-link
+/// de-duplication hold across directories *and* across threads.
 #[derive(Debug, Default)]
 pub struct Sizer {
     /// `(device, inode)` of the multiply-linked files already counted.
-    counted: HashSet<(u64, u64)>,
+    counted: Arc<Mutex<HashSet<(u64, u64)>>>,
     /// Paths that could not be read, and why.
     pub unreadable: Vec<String>,
     /// How many of those were a permission problem.
     pub denied: usize,
+    /// Files that live in iCloud and not on this disk.
+    pub evicted: usize,
 }
 
 impl Sizer {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A sizer for another thread, sharing what has already been counted.
+    fn fork(&self) -> Self {
+        Self {
+            counted: Arc::clone(&self.counted),
+            ..Self::default()
+        }
+    }
+
+    /// Folds a forked sizer's findings back in.
+    fn absorb(&mut self, other: Sizer) {
+        self.denied += other.denied;
+        self.evicted += other.evicted;
+        for line in other.unreadable {
+            if self.unreadable.len() < 50 {
+                self.unreadable.push(line);
+            }
+        }
     }
 
     /// Size of an entry, recursive for a directory. Symlinks are never
@@ -115,7 +167,7 @@ impl Sizer {
         };
 
         if !meta.is_dir() {
-            return self.count_file(&meta);
+            return self.count_file(path, &meta);
         }
 
         let mut total = occupied(&meta);
@@ -130,10 +182,21 @@ impl Sizer {
         total
     }
 
-    /// Counts a file once, however many hard links point at it.
-    fn count_file(&mut self, meta: &fs::Metadata) -> u64 {
-        if meta.nlink() > 1 && !self.counted.insert((meta.dev(), meta.ino())) {
+    /// Counts a file once, however many hard links point at it, and never
+    /// counts one that is not really here.
+    fn count_file(&mut self, path: &Path, meta: &fs::Metadata) -> u64 {
+        if is_evicted(path, meta) {
+            self.evicted += 1;
             return 0;
+        }
+        if meta.nlink() > 1 {
+            let mut counted = match self.counted.lock() {
+                Ok(counted) => counted,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if !counted.insert((meta.dev(), meta.ino())) {
+                return 0;
+            }
         }
         occupied(meta)
     }
@@ -149,9 +212,84 @@ impl Sizer {
     }
 }
 
-/// Size of a single entry, when no de-duplication across calls is needed.
+/// Measures one or more trees at once, on a few threads.
+///
+/// Passing every directory of a target in one call is what keeps hard-link
+/// de-duplication honest: a file linked from two package stores is counted
+/// once, not once per store.
+pub fn measure_all(roots: &[PathBuf]) -> (u64, Sizer) {
+    let (totals, sizer) = measure_each(roots);
+    (totals.iter().sum(), sizer)
+}
+
+/// Measures several trees and reports each one separately.
+///
+/// One shared set of counted inodes across the whole call, so the per-entry
+/// figures still add up to a total that does not count a hard-linked file
+/// twice.
+pub fn measure_each(roots: &[PathBuf]) -> (Vec<u64>, Sizer) {
+    let mut sizer = Sizer::new();
+    let count = roots.len();
+    let seed: Vec<(PathBuf, usize)> = roots
+        .iter()
+        .cloned()
+        .enumerate()
+        .map(|(index, path)| (path, index))
+        .collect();
+
+    let states = par::drain(
+        seed,
+        || (sizer.fork(), vec![0u64; count]),
+        |(worker, totals), (path, root), extra| {
+            let meta = match fs::symlink_metadata(&path) {
+                Ok(meta) => meta,
+                Err(err) => {
+                    worker.note(&path, &err);
+                    return;
+                }
+            };
+
+            if !meta.is_dir() {
+                totals[root] += worker.count_file(&path, &meta);
+                return;
+            }
+
+            totals[root] += occupied(&meta);
+            match fs::read_dir(&path) {
+                Ok(entries) => extra.extend(entries.flatten().map(|entry| (entry.path(), root))),
+                Err(err) => worker.note(&path, &err),
+            }
+        },
+    );
+
+    let mut totals = vec![0u64; count];
+    for (worker, partial) in states {
+        for (index, bytes) in partial.into_iter().enumerate() {
+            totals[index] += bytes;
+        }
+        sizer.absorb(worker);
+    }
+    (totals, sizer)
+}
+
+/// Measures a single tree.
+pub fn measure(path: &Path) -> (u64, Sizer) {
+    measure_all(std::slice::from_ref(&path.to_path_buf()))
+}
+
+/// Last modification of an entry, in seconds since the epoch.
+pub fn mtime(path: &Path) -> u64 {
+    fs::symlink_metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+/// Size of a single entry, when the caller has nothing to report.
 pub fn size_of(path: &Path) -> u64 {
-    Sizer::new().size_of(path)
+    measure(path).0
 }
 
 /// Whether the process can read the parts of the home library that macOS
@@ -323,45 +461,136 @@ pub fn remove(path: &Path, policy: &Policy) -> Result<Removal, String> {
     }
 }
 
-/// Empties a directory without removing the directory itself.
-pub fn empty_dir(path: &Path, policy: &Policy) -> Removal {
+/// Removes a known list of entries, honouring the policy.
+///
+/// The caller picks what goes, which is what lets a measurement and the
+/// removal that follows agree on exactly the same set.
+pub fn remove_entries(entries: &[PathBuf], policy: &Policy) -> Removal {
+    remove_measured(entries, &[], policy)
+}
+
+/// The same, with sizes somebody already paid to compute.
+///
+/// `known` is parallel to `entries`; a `None` is measured here. It is what
+/// lets a `clean` right after a `scan` avoid walking the same disk twice.
+pub fn remove_measured(entries: &[PathBuf], known: &[Option<u64>], policy: &Policy) -> Removal {
     let mut result = Removal::default();
 
-    let entries = match fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(err) => {
-            result
-                .errors
-                .push(format!("{}: {err}", format::tilde(path)));
-            return result;
-        }
-    };
+    let wanted: Vec<(usize, &PathBuf)> = entries
+        .iter()
+        .enumerate()
+        .filter(|(_, path)| {
+            if policy.excludes.blocks(path) {
+                result.excluded += 1;
+                return false;
+            }
+            true
+        })
+        .collect();
 
-    // One sizer for the whole directory, so hard-linked twins are not
-    // counted twice (package stores are full of them).
-    let mut sizer = Sizer::new();
+    // Anything without a size yet is measured in one parallel pass, so
+    // hard-linked twins are still only counted once.
+    let unknown: Vec<PathBuf> = wanted
+        .iter()
+        .filter(|(index, _)| known.get(*index).copied().flatten().is_none())
+        .map(|(_, path)| (*path).clone())
+        .collect();
+    let (measured, sizer) = measure_each(&unknown);
+    result.errors.extend(sizer.unreadable);
 
-    for entry in entries.flatten() {
-        let entry_path = entry.path();
+    let mut next = 0;
+    for (index, path) in wanted {
+        let bytes = match known.get(index).copied().flatten() {
+            Some(bytes) => bytes,
+            None => {
+                let bytes = measured.get(next).copied().unwrap_or(0);
+                next += 1;
+                bytes
+            }
+        };
 
-        if policy.excludes.blocks(&entry_path) {
-            result.excluded += 1;
-            continue;
-        }
-
-        let bytes = sizer.size_of(&entry_path);
-        if let Err(err) = result.record(&entry_path, bytes, policy) {
-            result
-                .errors
-                .push(format!("{}: {err}", format::tilde(&entry_path)));
+        if let Err(err) = result.record(path, bytes, policy) {
+            result.errors.push(err.to_string());
         }
     }
 
-    result.errors.extend(sizer.unreadable);
     result
 }
 
+/// The entries of a directory, oldest change first.
+pub fn entries_of(dir: &Path) -> Result<Vec<PathBuf>, String> {
+    let entries = fs::read_dir(dir).map_err(|err| format!("{}: {err}", format::tilde(dir)))?;
+    Ok(entries.flatten().map(|entry| entry.path()).collect())
+}
+
+/// Days since an entry last changed, as far as the filesystem knows.
+pub fn age_days(path: &Path) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    let Ok(modified) = meta.modified() else {
+        return 0;
+    };
+    modified
+        .elapsed()
+        .map(|since| since.as_secs() / 86_400)
+        .unwrap_or(0)
+}
+
 // ── walking ─────────────────────────────────────────────────────────────────
+
+/// Walks `root`, calling `visit` for every file with the space it occupies.
+///
+/// Symlinks are not followed, system and package-manager directories are
+/// skipped, and the depth is bounded. The walk is threaded, so `visit` must be
+/// callable from any of them. Returns what could not be read.
+pub fn walk_files(root: &Path, max_depth: usize, visit: &(impl Fn(&Path, u64) + Sync)) -> Sizer {
+    let mut sizer = Sizer::new();
+
+    let states = par::drain(
+        vec![(root.to_path_buf(), 0usize)],
+        || sizer.fork(),
+        |worker, (path, depth), extra| {
+            let Ok(meta) = fs::symlink_metadata(&path) else {
+                return;
+            };
+            if meta.file_type().is_symlink() {
+                return;
+            }
+
+            if !meta.is_dir() {
+                let bytes = worker.count_file(&path, &meta);
+                visit(&path, bytes);
+                return;
+            }
+
+            if depth > max_depth {
+                return;
+            }
+            // The root is walked whatever it is called; only what is found
+            // inside it can be skipped by name.
+            let skip = depth > 0
+                && path
+                    .file_name()
+                    .is_some_and(|name| SKIPPED_DIRS.contains(&name.to_string_lossy().as_ref()));
+            if skip {
+                return;
+            }
+
+            match fs::read_dir(&path) {
+                Ok(entries) => {
+                    extra.extend(entries.flatten().map(|entry| (entry.path(), depth + 1)))
+                }
+                Err(err) => worker.note(&path, &err),
+            }
+        },
+    );
+
+    for worker in states {
+        sizer.absorb(worker);
+    }
+    sizer
+}
 
 /// Directories skipped when walking the home tree.
 const SKIPPED_DIRS: &[&str] = &[
@@ -373,57 +602,6 @@ const SKIPPED_DIRS: &[&str] = &[
     ".rustup",
     "Applications",
 ];
-
-/// Walks `root` depth-first, calling `visit` for every file.
-///
-/// Symlinks are not followed, system and package-manager directories are
-/// skipped, and the depth is bounded. Returns what could not be read.
-pub fn walk_files(root: &Path, max_depth: usize, visit: &mut impl FnMut(&Path, u64)) -> Sizer {
-    fn inner(
-        dir: &Path,
-        depth: usize,
-        max_depth: usize,
-        sizer: &mut Sizer,
-        visit: &mut impl FnMut(&Path, u64),
-    ) {
-        if depth > max_depth {
-            return;
-        }
-        let entries = match fs::read_dir(dir) {
-            Ok(entries) => entries,
-            Err(err) => {
-                sizer.note(dir, &err);
-                return;
-            }
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Ok(meta) = entry.metadata().or_else(|_| fs::symlink_metadata(&path)) else {
-                continue;
-            };
-            if meta.file_type().is_symlink() {
-                continue;
-            }
-
-            if meta.is_dir() {
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if SKIPPED_DIRS.contains(&name.as_ref()) {
-                    continue;
-                }
-                inner(&path, depth + 1, max_depth, sizer, visit);
-            } else {
-                let bytes = sizer.count_file(&meta);
-                visit(&path, bytes);
-            }
-        }
-    }
-
-    let mut sizer = Sizer::new();
-    inner(root, 0, max_depth, &mut sizer, visit);
-    sizer
-}
 
 /// Lists the `.plist` files of a directory, sorted by name.
 pub fn plists(dir: &Path) -> Vec<PathBuf> {
@@ -502,12 +680,13 @@ mod tests {
         fs::write(dir.join("a.txt"), b"1234567890").unwrap();
         let excludes = Excludes::default();
 
-        let result = empty_dir(&dir, &policy(true, &excludes));
+        let entries = entries_of(&dir).unwrap();
+        let result = remove_entries(&entries, &policy(true, &excludes));
         assert!(result.freed > 0);
         assert_eq!(result.removed, 1);
         assert!(dir.join("a.txt").exists());
 
-        let result = empty_dir(&dir, &policy(false, &excludes));
+        let result = remove_entries(&entries, &policy(false, &excludes));
         assert!(result.freed > 0);
         assert!(!dir.join("a.txt").exists());
         assert!(dir.exists());
@@ -522,11 +701,50 @@ mod tests {
         fs::write(dir.join("drop.txt"), b"whatever").unwrap();
         let excludes = Excludes::new(vec!["keep.txt".to_string()]);
 
-        let result = empty_dir(&dir, &policy(false, &excludes));
+        let result = remove_entries(&entries_of(&dir).unwrap(), &policy(false, &excludes));
         assert_eq!(result.excluded, 1);
         assert_eq!(result.removed, 1);
         assert!(dir.join("keep.txt").exists());
         assert!(!dir.join("drop.txt").exists());
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_fresh_file_has_no_age() {
+        let dir = temp_dir("age");
+        let path = dir.join("new.txt");
+        fs::write(&path, b"just written").unwrap();
+        assert_eq!(age_days(&path), 0);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn icloud_placeholders_are_recognised() {
+        let dir = temp_dir("icloud");
+        // The visible stand-in for an evicted file takes no space itself.
+        let placeholder = dir.join(".report.pdf.icloud");
+        fs::write(&placeholder, b"stub").unwrap();
+        let meta = fs::symlink_metadata(&placeholder).unwrap();
+        assert!(is_evicted(&placeholder, &meta));
+
+        let real = dir.join("report.pdf");
+        fs::write(&real, b"content").unwrap();
+        let meta = fs::symlink_metadata(&real).unwrap();
+        assert!(!is_evicted(&real, &meta));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn evicted_files_are_not_counted_as_space() {
+        let dir = temp_dir("icloud-size");
+        fs::write(dir.join(".big.mov.icloud"), vec![0u8; 4096]).unwrap();
+
+        let (bytes, sizer) = measure(&dir);
+        assert_eq!(sizer.evicted, 1);
+        // Only the directory itself weighs anything.
+        assert!(bytes < 4096);
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -546,7 +764,7 @@ mod tests {
 
         let excludes = Excludes::default();
         let policy = Policy::new(false, Disposal::Trash, &excludes);
-        let result = empty_dir(&dir, &policy);
+        let result = remove_entries(&entries_of(&dir).unwrap(), &policy);
 
         assert_eq!(result.freed, 0, "trashing frees nothing yet");
         assert!(result.trashed > 0);

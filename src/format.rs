@@ -159,6 +159,44 @@ fn civil(epoch: u64) -> (i64, u32, u32, u32, u32, u32) {
     )
 }
 
+/// Seconds since the epoch for a UTC civil date — the inverse of `civil`.
+fn epoch_from_civil(year: i64, month: u32, day: u32, hour: u32, minute: u32, second: u32) -> u64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let yoe = year - era * 400;
+    let month = i64::from(month);
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+
+    let seconds =
+        days * 86_400 + i64::from(hour) * 3600 + i64::from(minute) * 60 + i64::from(second);
+    seconds.max(0) as u64
+}
+
+/// Parses the timestamp Spotlight prints: `2026-03-14 09:12:33 +0000`.
+pub fn parse_spotlight_date(raw: &str) -> Option<u64> {
+    let raw = raw.trim();
+    if raw.is_empty() || raw == "(null)" {
+        return None;
+    }
+
+    let (date, rest) = raw.split_once(' ')?;
+    let clock = rest.split(' ').next()?;
+
+    let mut parts = date.split('-');
+    let year: i64 = parts.next()?.parse().ok()?;
+    let month: u32 = parts.next()?.parse().ok()?;
+    let day: u32 = parts.next()?.parse().ok()?;
+
+    let mut clock = clock.split(':');
+    let hour: u32 = clock.next()?.parse().ok()?;
+    let minute: u32 = clock.next()?.parse().ok()?;
+    let second: u32 = clock.next().unwrap_or("0").parse().ok()?;
+
+    Some(epoch_from_civil(year, month, day, hour, minute, second))
+}
+
 /// A timestamp a human reads: `2026-09-18 23:05`.
 pub fn datetime(epoch: u64) -> String {
     let (year, month, day, hour, minute, _) = civil(epoch);
@@ -211,6 +249,25 @@ mod tests {
     fn rejects_garbage() {
         assert!(parse_size("plenty").is_err());
         assert!(parse_size("12x").is_err());
+    }
+
+    #[test]
+    fn civil_dates_survive_a_round_trip() {
+        for epoch in [0u64, 1_000_000_000, 1_789_000_000, 2_000_000_000] {
+            let (y, mo, d, h, mi, s) = civil(epoch);
+            // `civil` is local, so undo the offset the round trip reapplies.
+            let back = epoch_from_civil(y, mo, d, h, mi, s) as i64 - local_offset();
+            assert_eq!(back, epoch as i64, "epoch {epoch}");
+        }
+    }
+
+    #[test]
+    fn reads_spotlight_timestamps() {
+        let epoch = parse_spotlight_date("2026-03-14 09:12:33 +0000").unwrap();
+        assert_eq!(epoch, epoch_from_civil(2026, 3, 14, 9, 12, 33));
+        assert!(parse_spotlight_date("(null)").is_none());
+        assert!(parse_spotlight_date("").is_none());
+        assert!(parse_spotlight_date("garbage").is_none());
     }
 
     #[test]

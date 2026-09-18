@@ -20,6 +20,8 @@ pub struct Config {
     pub default_targets: Vec<String>,
     /// Ask a second time before anything irreversible.
     pub confirm_twice: bool,
+    /// Leave alone anything touched more recently than this many days.
+    pub min_age_days: u64,
     /// Where the settings were read from.
     pub source: Option<PathBuf>,
     /// Lines that could not be understood.
@@ -33,6 +35,7 @@ impl Default for Config {
             disposal: Disposal::Trash,
             default_targets: Vec::new(),
             confirm_twice: true,
+            min_age_days: 0,
             source: None,
             problems: Vec::new(),
         }
@@ -77,6 +80,12 @@ impl Config {
                     )),
                 },
                 ("confirm_twice", Value::Bool(flag)) => config.confirm_twice = flag,
+                ("min_age_days", Value::Text(days)) => match days.parse() {
+                    Ok(days) => config.min_age_days = days,
+                    Err(_) => config.problems.push(format!(
+                        "line {line}: min_age_days must be a number, not `{days}`"
+                    )),
+                },
                 (other, _) => config.problems.push(format!(
                     "line {line}: unknown or mistyped setting `{other}`"
                 )),

@@ -1,6 +1,7 @@
 //! Cleaning targets: measurement and removal.
 
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use serde::Serialize;
 
@@ -66,6 +67,8 @@ pub enum Target {
     Simulators,
     /// Local backups of iPhones and iPads (your data, asked for explicitly).
     IosBackups,
+    /// Virtual machines and container runtimes (your data, asked for explicitly).
+    Vm,
 }
 
 impl Target {
@@ -84,6 +87,23 @@ impl Target {
         Target::Homebrew,
         Target::Docker,
         Target::Xcode,
+    ];
+
+    /// Every target that can be named on the command line.
+    pub const EVERY: [Target; 13] = [
+        Target::Cache,
+        Target::ContainerCache,
+        Target::PkgCache,
+        Target::Trash,
+        Target::TrashAll,
+        Target::Logs,
+        Target::DsStore,
+        Target::Homebrew,
+        Target::Docker,
+        Target::Xcode,
+        Target::Simulators,
+        Target::IosBackups,
+        Target::Vm,
     ];
 
     /// Targets measured by a bare `detox scan`.
@@ -109,6 +129,7 @@ impl Target {
             Target::Xcode => "Xcode data",
             Target::Simulators => "iOS simulators",
             Target::IosBackups => "iOS device backups",
+            Target::Vm => "Virtual machines",
         }
     }
 
@@ -127,15 +148,16 @@ impl Target {
             Target::Xcode => "xcode",
             Target::Simulators => "simulators",
             Target::IosBackups => "ios-backups",
+            Target::Vm => "vm",
         }
     }
 
     /// The target a command-line slug names.
     pub fn from_slug(slug: &str) -> Option<Target> {
-        let mut all = Target::DEFAULT.to_vec();
-        all.push(Target::Simulators);
-        all.push(Target::IosBackups);
-        all.into_iter().find(|target| target.slug() == slug)
+        Target::EVERY
+            .iter()
+            .copied()
+            .find(|target| target.slug() == slug)
     }
 
     /// Whether cleaning this target this way cannot be undone.
@@ -154,7 +176,7 @@ impl Target {
             Target::PkgCache | Target::Docker | Target::Xcode | Target::Simulators => {
                 Risk::Rebuildable
             }
-            Target::Trash | Target::TrashAll | Target::IosBackups => Risk::Data,
+            Target::Trash | Target::TrashAll | Target::IosBackups | Target::Vm => Risk::Data,
         }
     }
 
@@ -195,6 +217,7 @@ impl Target {
             Target::IosBackups => Strategy::Dirs(vec![fsx::home_join(
                 "Library/Application Support/MobileSync/Backup",
             )]),
+            Target::Vm => Strategy::Dirs(virtual_machines()),
         }
     }
 }
@@ -242,6 +265,25 @@ fn package_caches() -> Vec<PathBuf> {
         "Library/Caches/composer",
         ".nuget/packages",
         ".pub-cache",
+    ]
+    .iter()
+    .map(|suffix| fsx::home_join(suffix))
+    .collect()
+}
+
+/// Where virtual machines and container runtimes keep their disk images.
+///
+/// Tens of gigabytes that nothing else on the machine accounts for — and real
+/// data, so this target is never part of `all`.
+fn virtual_machines() -> Vec<PathBuf> {
+    [
+        ".colima",
+        ".lima",
+        ".local/share/containers",
+        "VirtualBox VMs",
+        ".vagrant.d/boxes",
+        "Virtual Machines.localized",
+        "Parallels",
     ]
     .iter()
     .map(|suffix| fsx::home_join(suffix))
@@ -301,6 +343,9 @@ pub struct Measure {
     pub denied: usize,
     /// Why the target is unavailable on this machine.
     pub unavailable: Option<String>,
+    /// What each entry weighed, so a `clean` right after need not walk again.
+    #[serde(skip)]
+    pub entries: Vec<(PathBuf, u64)>,
 }
 
 impl Measure {
@@ -313,6 +358,7 @@ impl Measure {
             items,
             denied,
             unavailable: None,
+            entries: Vec::new(),
         }
     }
 
@@ -325,12 +371,33 @@ impl Measure {
             items: 0,
             denied: 0,
             unavailable: Some(reason.into()),
+            entries: Vec::new(),
         }
     }
 }
 
+/// The entries a target would act on: everything in its directories, minus
+/// what is too recent to be considered idle.
+fn entries_of(dirs: &[&PathBuf], min_age_days: u64) -> Vec<PathBuf> {
+    let mut entries = Vec::new();
+    for dir in dirs {
+        let Ok(found) = fsx::entries_of(dir) else {
+            continue;
+        };
+        for path in found {
+            if min_age_days == 0 || fsx::age_days(&path) >= min_age_days {
+                entries.push(path);
+            }
+        }
+    }
+    entries
+}
+
 /// Measures the reclaimable space of a target, changing nothing.
-pub fn measure(target: Target) -> Measure {
+///
+/// `min_age_days` leaves alone anything touched recently — a cache an
+/// application is using right now is not reclaimable in any useful sense.
+pub fn measure(target: Target, min_age_days: u64) -> Measure {
     match target.strategy() {
         Strategy::Dirs(dirs) => {
             let existing: Vec<&PathBuf> = dirs.iter().filter(|d| d.is_dir()).collect();
@@ -338,20 +405,16 @@ pub fn measure(target: Target) -> Measure {
                 return Measure::unavailable(target, "directory not found");
             }
 
-            // One sizer for every directory of the target: a file hard-linked
-            // between two package stores is counted once.
-            let mut sizer = fsx::Sizer::new();
-            let mut bytes = 0;
-            let mut items = 0;
-
-            for dir in existing {
-                bytes += sizer.size_of(dir);
-                items += std::fs::read_dir(dir)
-                    .map(|entries| entries.flatten().count())
-                    .unwrap_or(0);
-            }
+            // Every entry of the target measured in one pass: the threads share
+            // one set of counted inodes, so a file hard-linked between two
+            // package stores is counted once, not once per store.
+            let entries = entries_of(&existing, min_age_days);
+            let (each, sizer) = fsx::measure_each(&entries);
+            let bytes = each.iter().sum();
+            let items = entries.len();
 
             let mut measure = Measure::new(target, bytes, items, sizer.denied);
+            measure.entries = entries.into_iter().zip(each).collect();
             if sizer.denied > 0 && bytes == 0 {
                 measure.unavailable =
                     Some(format!("unreadable — {}", fsx::full_disk_access_hint()));
@@ -359,6 +422,7 @@ pub fn measure(target: Target) -> Measure {
             measure
         }
         Strategy::DsStore => {
+            let _ = min_age_days;
             let (files, denied) = ds_store_files();
             let bytes = files.iter().map(|(_, size)| size).sum();
             Measure::new(target, bytes, files.len(), denied)
@@ -381,6 +445,46 @@ pub fn measure(target: Target) -> Measure {
             Err(reason) => Measure::unavailable(target, reason),
         },
     }
+}
+
+/// Applications that are running right now and whose cache is about to go.
+///
+/// Emptying the cache of a live application ranges from harmless to a
+/// corrupted profile, and the memory snapshot already knows exactly who is
+/// running — so this costs one existing call and no new dependency.
+pub fn running_conflicts(targets: &[Target]) -> Vec<String> {
+    let touches_caches = targets
+        .iter()
+        .any(|target| matches!(target, Target::Cache | Target::ContainerCache));
+    if !touches_caches {
+        return Vec::new();
+    }
+
+    let snapshot = super::ram::snapshot(false);
+    let mut names = Vec::new();
+
+    for group in &snapshot.groups {
+        let Some(bundle) = &group.bundle else {
+            continue;
+        };
+        let Some(id) = super::orphans::bundle_id(bundle) else {
+            continue;
+        };
+
+        let has_cache = fsx::home_join("Library/Caches").join(&id).is_dir()
+            || fsx::home_join("Library/Containers")
+                .join(&id)
+                .join("Data/Library/Caches")
+                .is_dir();
+
+        if has_cache {
+            names.push(group.name.clone());
+        }
+    }
+
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Result of cleaning a target.
@@ -427,8 +531,8 @@ impl Cleaned {
     }
 }
 
-/// Cleans a target.
-pub fn clean(target: Target, ctx: &Ctx) -> Cleaned {
+/// Cleans a target, reusing whatever a recent scan already measured.
+pub fn clean(target: Target, ctx: &Ctx, known: &super::sizes::Sizes) -> Cleaned {
     // Some targets can only ever be purged, whatever the user asked for.
     let policy = if target.always_purges() {
         ctx.policy().purging()
@@ -437,7 +541,7 @@ pub fn clean(target: Target, ctx: &Ctx) -> Cleaned {
     };
 
     match target.strategy() {
-        Strategy::Dirs(dirs) => clean_dirs(target, &dirs, &policy, ctx),
+        Strategy::Dirs(dirs) => clean_dirs(target, &dirs, &policy, ctx, known),
         Strategy::DsStore => clean_ds_store(target, &policy, ctx),
         Strategy::Homebrew => clean_homebrew(target, ctx),
         Strategy::Docker => clean_docker(target, ctx),
@@ -481,28 +585,31 @@ fn clean_docker(target: Target, ctx: &Ctx) -> Cleaned {
     }
 }
 
-fn clean_dirs(target: Target, dirs: &[PathBuf], policy: &Policy, ctx: &Ctx) -> Cleaned {
+fn clean_dirs(
+    target: Target,
+    dirs: &[PathBuf],
+    policy: &Policy,
+    ctx: &Ctx,
+    known: &super::sizes::Sizes,
+) -> Cleaned {
     let existing: Vec<&PathBuf> = dirs.iter().filter(|d| d.is_dir()).collect();
     if existing.is_empty() {
         return Cleaned::skipped(target, "directory not found");
     }
 
-    let mut removal = fsx::Removal::default();
     let mut messages = Vec::new();
-
-    for dir in existing {
-        let result = fsx::empty_dir(dir, policy);
-        if result.removed > 0 {
-            messages.push(format!(
-                "{} — {} ({} item(s))",
-                format::tilde(dir),
-                format::size(result.total()),
-                result.removed
-            ));
-        }
-        removal.merge(result);
+    for dir in &existing {
+        messages.push(format::tilde(dir));
     }
 
+    // The same list the measurement used: what was announced is what goes.
+    let entries = entries_of(&existing, ctx.min_age_days);
+    let sizes = known.lookup(&entries);
+    let removal = fsx::remove_measured(&entries, &sizes, policy);
+
+    if removal.removed == 0 {
+        messages.clear();
+    }
     finish(target, removal, messages, policy, ctx)
 }
 
@@ -621,30 +728,26 @@ fn homebrew_cache() -> Result<PathBuf, String> {
 /// The `.DS_Store` files of the home directory with their size, and how many
 /// directories refused to be read along the way.
 fn ds_store_files() -> (Vec<(PathBuf, u64)>, usize) {
-    let mut files = Vec::new();
-    let sizer = fsx::walk_files(&fsx::home(), 12, &mut |path, size| {
+    let files = Mutex::new(Vec::new());
+
+    let sizer = fsx::walk_files(&fsx::home(), 12, &|path, size| {
         if path.file_name().is_some_and(|name| name == ".DS_Store") {
-            files.push((path.to_path_buf(), size));
+            if let Ok(mut found) = files.lock() {
+                found.push((path.to_path_buf(), size));
+            }
         }
     });
-    (files, sizer.denied)
+
+    (files.into_inner().unwrap_or_default(), sizer.denied)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Every target that can be named on the command line.
-    fn every_target() -> Vec<Target> {
-        let mut targets = Target::DEFAULT.to_vec();
-        targets.push(Target::Simulators);
-        targets.push(Target::IosBackups);
-        targets
-    }
-
     #[test]
     fn every_target_has_a_distinct_slug() {
-        let mut slugs: Vec<&str> = every_target().iter().map(|t| t.slug()).collect();
+        let mut slugs: Vec<&str> = Target::EVERY.iter().map(|t| t.slug()).collect();
         let count = slugs.len();
         slugs.sort_unstable();
         slugs.dedup();
@@ -655,6 +758,14 @@ mod tests {
     fn all_leaves_out_what_cannot_be_downloaded_again() {
         assert!(!Target::DEFAULT.contains(&Target::Simulators));
         assert!(!Target::DEFAULT.contains(&Target::IosBackups));
+        assert!(!Target::DEFAULT.contains(&Target::Vm));
+    }
+
+    #[test]
+    fn every_target_is_reachable_by_its_slug() {
+        for target in Target::EVERY {
+            assert_eq!(Target::from_slug(target.slug()), Some(target));
+        }
     }
 
     #[test]

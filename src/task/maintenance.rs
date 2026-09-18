@@ -84,6 +84,35 @@ pub fn thin_snapshots(ctx: &Ctx) -> Outcome {
     }
 }
 
+/// Deletes the simulator devices whose runtime is gone.
+///
+/// The safe half of the `simulators` target: `simctl delete unavailable` only
+/// removes devices whose runtime Xcode no longer ships, so nothing you could
+/// still boot is touched.
+pub fn prune_simulators(ctx: &Ctx) -> Outcome {
+    let action = "Unavailable simulators";
+
+    if !cmd::exists("xcrun") {
+        return Outcome::skipped(action, "Xcode command line tools are not installed");
+    }
+    if ctx.dry_run {
+        return Outcome::new(action, Status::Simulated).with("xcrun simctl delete unavailable");
+    }
+
+    match cmd::run("xcrun", &["simctl", "delete", "unavailable"]) {
+        Ok(output) => {
+            let mut outcome = Outcome::ok(action, false);
+            if output.text().is_empty() {
+                outcome.push("nothing to delete");
+            } else {
+                outcome.push(output.text().to_string());
+            }
+            outcome
+        }
+        Err(err) => Outcome::failed(action, err),
+    }
+}
+
 /// Lists available macOS updates (read only).
 pub fn check_updates() -> Outcome {
     let action = "macOS updates";

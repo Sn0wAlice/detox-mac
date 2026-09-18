@@ -11,10 +11,13 @@ use crate::cli::{
 use crate::config::Config;
 use crate::format;
 use crate::sys::fsx::{self, Disposal};
-use crate::sys::machine::Machine;
+use crate::sys::machine::{self, Machine};
+use crate::sys::par;
 use crate::task::agents::{self, Action, Agent, Scope};
 use crate::task::clean::{self, Target};
-use crate::task::{Ctx, Outcome, Status, dev, journal, maintenance, orphans, ram, scan};
+use crate::task::{
+    Ctx, Outcome, Status, dev, journal, maintenance, orphans, ram, scan, schedule, sizes,
+};
 use crate::ui::Printer;
 
 /// Runs the requested command. Returns `false` when something failed.
@@ -41,6 +44,7 @@ pub fn run(cli: Cli) -> bool {
         yes: options.yes,
         json: options.json,
         purge: options.purge,
+        min_age_days: config.min_age_days,
         config,
         printer,
     };
@@ -51,11 +55,21 @@ pub fn run(cli: Cli) -> bool {
 
     match cli.command {
         Command::Info => info(&ctx),
-        Command::Scan { targets } => scan_targets(&ctx, resolve(&ctx, &targets, &Target::QUICK)),
-        Command::Clean { targets } => {
+        Command::Scan {
+            targets,
+            older_than,
+        } => {
+            let ctx = with_age(&ctx, older_than);
+            scan_targets(&ctx, resolve(&ctx, &targets, &Target::QUICK))
+        }
+        Command::Clean {
+            targets,
+            older_than,
+        } => {
+            let ctx = with_age(&ctx, older_than);
             clean_targets(&ctx, resolve(&ctx, &targets, &Target::DEFAULT))
         }
-        Command::Apps { top } => apps(&ctx, top),
+        Command::Apps { top, unused } => apps(&ctx, top, unused),
         Command::Files { command } => match command {
             FileCommand::Large {
                 min,
@@ -63,6 +77,13 @@ pub fn run(cli: Cli) -> bool {
                 path,
                 depth,
             } => large_files(&ctx, min, top, path, depth),
+            FileCommand::Downloads {
+                older_than,
+                path,
+                all,
+                clean,
+                top,
+            } => downloads(&ctx, older_than, path, all, clean, top),
             FileCommand::Dev { filter, top } => dev_residue(&ctx, &filter, top, None, false),
             FileCommand::Clean {
                 filter,
@@ -82,6 +103,8 @@ pub fn run(cli: Cli) -> bool {
             force,
             system,
         } => kill(&ctx, &target.join(" "), force, system),
+        Command::Uninstall { target } => uninstall(&ctx, &target.join(" ")),
+        Command::Schedule { when, targets, at } => schedule(&ctx, when, &targets, at),
         Command::Orphans { clean, only, top } => leftovers(&ctx, clean, &only, top),
         Command::History { top } => history(&ctx, top),
         Command::Undo { id } => undo_run(&ctx, id.as_deref()),
@@ -98,6 +121,17 @@ pub fn run(cli: Cli) -> bool {
             clap_complete::generate(shell, &mut command, name, &mut std::io::stdout());
             true
         }
+    }
+}
+
+/// The context with the age floor the command line asked for, if any.
+fn with_age(ctx: &Ctx, older_than: Option<u64>) -> Ctx {
+    match older_than {
+        Some(days) => Ctx {
+            min_age_days: days,
+            ..ctx.clone()
+        },
+        None => ctx.clone(),
     }
 }
 
@@ -158,16 +192,27 @@ fn take<T>(items: &[T], top: usize) -> &[T] {
 /// Measures several targets, showing a progress bar.
 fn measure_targets(ctx: &Ctx, targets: &[Target]) -> Vec<clean::Measure> {
     let mut progress = ctx.printer.bar("Measuring", targets.len());
-    let measures = targets
+    let measures: Vec<clean::Measure> = targets
         .iter()
         .map(|&target| {
             progress.tick(target.label());
-            let measure = clean::measure(target);
+            let measure = clean::measure(target, ctx.min_age_days);
             progress.advance(target.label());
             measure
         })
         .collect();
     progress.finish();
+
+    // Hand the figures to whichever `clean` comes next, so it does not walk
+    // the same disk over again.
+    let measured: Vec<(PathBuf, u64)> = measures
+        .iter()
+        .flat_map(|measure| measure.entries.iter().cloned())
+        .collect();
+    if !measured.is_empty() {
+        sizes::save(&measured);
+    }
+
     measures
 }
 
@@ -310,6 +355,29 @@ fn render_measure(p: &Printer, measure: &clean::Measure) {
         format::size(measure.bytes),
         p.dim(&detail)
     ));
+}
+
+/// Names the applications whose cache is about to be pulled from under them.
+fn warn_running_apps(ctx: &Ctx, targets: &[Target]) {
+    if ctx.json || ctx.yes || ctx.dry_run {
+        return;
+    }
+
+    let mut progress = ctx.printer.spinner("Checking what is running");
+    progress.tick("ps, top");
+    let running = clean::running_conflicts(targets);
+    progress.finish();
+
+    if running.is_empty() {
+        return;
+    }
+    ctx.printer.warn(format!(
+        "{} running application(s) will lose their cache: {}",
+        running.len(),
+        format::truncate(&running.join(", "), 60)
+    ));
+    ctx.printer
+        .warn("quit them first if you would rather not find out what that does.");
 }
 
 /// Says so, once, when macOS is hiding part of what was asked for.
@@ -463,6 +531,7 @@ fn render_disposal(ctx: &Ctx, freed: u64, trashed: u64) {
 
 fn clean_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
     warn_missing_access(ctx, &targets);
+    warn_running_apps(ctx, &targets);
 
     let labels: Vec<&str> = targets.iter().map(|target| target.slug()).collect();
     let disposal = ctx.disposal();
@@ -476,12 +545,21 @@ fn clean_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
         return false;
     }
 
+    let before = (!ctx.dry_run).then(|| machine::free_space("/")).flatten();
+
+    // Sizes a scan measured moments ago, when they are still true.
+    let known = sizes::load();
+    if !known.is_empty() && !ctx.json {
+        ctx.printer
+            .info(ctx.printer.dim("  reusing the sizes from your last scan"));
+    }
+
     let mut progress = ctx.printer.bar("Cleaning", targets.len());
     let results: Vec<clean::Cleaned> = targets
         .iter()
         .map(|&target| {
             progress.tick(target.label());
-            let cleaned = clean::clean(target, ctx);
+            let cleaned = clean::clean(target, ctx, &known);
             progress.advance(target.label());
             cleaned
         })
@@ -567,26 +645,70 @@ fn clean_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
             "  {excluded} item(s) protected by your exclusions"
         )));
     }
+    render_disk_delta(ctx, before, removal.total());
     !failed
+}
+
+/// What the disk actually gave back, next to what was announced.
+///
+/// This is the line that keeps the rest of the tool honest: a measurement bug,
+/// an APFS clone or purgeable space all show up here as a gap, instead of
+/// hiding behind a confident total.
+fn render_disk_delta(ctx: &Ctx, before: Option<u64>, announced: u64) {
+    let Some(before) = before else {
+        return;
+    };
+    if announced == 0 {
+        return;
+    }
+    let Some(after) = machine::free_space("/") else {
+        return;
+    };
+
+    let gained = after.saturating_sub(before);
+    let lost = before.saturating_sub(after);
+    let delta = if lost > gained {
+        format!("-{}", format::size(lost))
+    } else {
+        format!("+{}", format::size(gained))
+    };
+
+    ctx.printer.info(ctx.printer.dim(&format!(
+        "  Disk free: {delta} — measured on a live machine, so it is indicative"
+    )));
 }
 
 // ── applications and large files ────────────────────────────────────────────
 
-fn apps(ctx: &Ctx, top: usize) -> bool {
+fn apps(ctx: &Ctx, top: usize, unused: Option<u64>) -> bool {
     let bundles = scan::application_bundles();
-    let mut progress = ctx.printer.bar("Measuring", bundles.len());
+    let progress = std::sync::Mutex::new(ctx.printer.bar("Measuring", bundles.len()));
 
-    let mut apps: Vec<scan::Entry> = bundles
-        .iter()
-        .map(|bundle| {
-            progress.tick(&bundle.file_stem().unwrap_or_default().to_string_lossy());
-            let entry = scan::measure_application(bundle);
-            progress.advance(&entry.name);
+    let mut apps: Vec<scan::Entry> = par::map(
+        &bundles,
+        |bundle| {
+            let mut entry = scan::measure_application(bundle);
+            // Size alone says which application is big. Size next to the last
+            // time it was opened says which one to actually remove.
+            if unused.is_some() {
+                entry.unused_days = scan::days_since_used(bundle);
+            }
             entry
-        })
-        .collect();
-    progress.finish();
+        },
+        |_, bundle| {
+            if let Ok(mut bar) = progress.lock() {
+                bar.advance(&bundle.file_stem().unwrap_or_default().to_string_lossy());
+            }
+        },
+    );
+    if let Ok(mut bar) = progress.lock() {
+        bar.finish();
+    }
 
+    if let Some(days) = unused {
+        // Never opened is the strongest case of all, so it counts as dormant.
+        apps.retain(|app| app.unused_days.is_none_or(|used| used >= days));
+    }
     apps.sort_by_key(|app| std::cmp::Reverse(app.bytes));
     let shown = take(&apps, top);
 
@@ -597,17 +719,187 @@ fn apps(ctx: &Ctx, top: usize) -> bool {
 
     let p = &ctx.printer;
     p.heading(&format!(
-        "Applications ({} — {})",
+        "{} ({} — {})",
+        match unused {
+            Some(days) => format!("Applications untouched for {days} day(s)"),
+            None => "Applications".to_string(),
+        },
         apps.len(),
         format::size(scan::total(&apps))
     ));
     for app in shown {
-        p.info(format!("  {:>10}  {}", format::size(app.bytes), app.name));
+        let note = match app.unused_days {
+            Some(days) => p.dim(&format!("last opened {days}d ago")),
+            None if unused.is_some() => p.dim("never opened"),
+            None => String::new(),
+        };
+        p.info(
+            format!(
+                "  {:>10}  {:<34} {}",
+                format::size(app.bytes),
+                app.name,
+                note
+            )
+            .trim_end(),
+        );
     }
     if shown.len() < apps.len() {
         p.info(p.dim(&format!("  … and {} more", apps.len() - shown.len())));
     }
+    if unused.is_some() && !apps.is_empty() {
+        p.info("");
+        p.info(p.dim("  detox uninstall <name>   removes one, leftovers included"));
+    }
     true
+}
+
+// ── dormant downloads ───────────────────────────────────────────────────────
+
+fn downloads(
+    ctx: &Ctx,
+    older_than: u64,
+    path: Option<PathBuf>,
+    all_types: bool,
+    clean: bool,
+    top: usize,
+) -> bool {
+    let p = &ctx.printer;
+    let root = path.unwrap_or_else(|| fsx::home_join("Downloads"));
+
+    if !root.is_dir() {
+        p.error(format!("{} is not a directory", root.display()));
+        return false;
+    }
+
+    let progress = std::sync::Mutex::new(p.spinner("Asking Spotlight"));
+    let mut found = scan::dormant(&root, older_than, !all_types, &|seen, path| {
+        if let Ok(mut bar) = progress.lock() {
+            bar.done_count(seen);
+            bar.tick(&format::tilde(path));
+        }
+    });
+    if let Ok(mut bar) = progress.lock() {
+        bar.finish();
+    }
+
+    found.retain(|entry| !ctx.config.exclude.blocks(&entry.path));
+    let total = scan::total(&found);
+
+    if !clean {
+        let shown = take(&found, top);
+        if ctx.json {
+            emit(json!({
+                "root": root,
+                "older_than_days": older_than,
+                "count": found.len(),
+                "total": total,
+                "files": shown,
+            }));
+            return true;
+        }
+
+        p.heading(&format!(
+            "In {}, untouched for {} day(s) ({} — {})",
+            format::tilde(&root),
+            older_than,
+            found.len(),
+            format::size(total)
+        ));
+        if found.is_empty() {
+            p.item(p.dim("nothing has been sitting there that long"));
+            return true;
+        }
+        for (index, entry) in shown.iter().enumerate() {
+            render_dormant(p, index + 1, entry);
+        }
+        if shown.len() < found.len() {
+            p.info(p.dim(&format!("  … and {} more", found.len() - shown.len())));
+        }
+        p.info("");
+        p.info(p.dim("  detox files downloads --clean   removes them"));
+        return true;
+    }
+
+    if found.is_empty() {
+        if ctx.json {
+            emit(json!({ "removed": [], "freed": 0 }));
+        } else {
+            p.skipped("Nothing dormant to remove.");
+        }
+        return true;
+    }
+
+    if !ctx.json {
+        p.heading(&format!(
+            "{} file(s), {} — untouched for {} day(s)",
+            found.len(),
+            format::size(total),
+            older_than
+        ));
+        for (index, entry) in found.iter().take(LISTED).enumerate() {
+            render_dormant(p, index + 1, entry);
+        }
+    }
+
+    let disposal = ctx.disposal();
+    if !ctx.confirm(&format!(
+        "Remove {} file(s) ({})?",
+        found.len(),
+        format::size(total)
+    )) {
+        if !ctx.json {
+            p.info("Cancelled.");
+        }
+        return false;
+    }
+    if disposal == Disposal::Purge
+        && !ctx.confirm_final(
+            "These are your downloads, and this cannot be undone.",
+            "delete forever",
+        )
+    {
+        if !ctx.json {
+            p.info("Cancelled.");
+        }
+        return false;
+    }
+
+    let paths: Vec<PathBuf> = found.iter().map(|entry| entry.path.clone()).collect();
+    let removal = fsx::remove_entries(&paths, &ctx.policy());
+    record_run(ctx, "files downloads --clean", disposal, &removal);
+
+    if ctx.json {
+        emit(json!({
+            "dry_run": ctx.dry_run,
+            "disposal": disposal,
+            "freed": removal.freed,
+            "trashed": removal.trashed,
+            "removed": removal.removed,
+        }));
+        return removal.errors.is_empty();
+    }
+
+    p.info("");
+    p.success(format!("{} file(s) removed", removal.removed));
+    for error in removal.errors.iter().take(5) {
+        p.error(error);
+    }
+    render_disposal(ctx, removal.freed, removal.trashed);
+    removal.errors.is_empty()
+}
+
+fn render_dormant(p: &Printer, number: usize, entry: &scan::Entry) {
+    let age = match entry.unused_days {
+        Some(days) => format!("{days}d"),
+        None => "never".to_string(),
+    };
+    p.info(format!(
+        "  {:>3}. {:>10}  {:<48} {}",
+        number,
+        format::size(entry.bytes),
+        format::truncate_start(&entry.name, 48),
+        p.dim(&age)
+    ));
 }
 
 fn large_files(ctx: &Ctx, min: u64, top: usize, path: Option<PathBuf>, depth: usize) -> bool {
@@ -618,12 +910,17 @@ fn large_files(ctx: &Ctx, min: u64, top: usize, path: Option<PathBuf>, depth: us
         return false;
     }
 
-    let mut progress = ctx.printer.spinner("Scanning");
-    let files = scan::large_files(&root, min, depth, &mut |seen, path| {
-        progress.done_count(seen);
-        progress.tick(&format::tilde(path));
+    // The walk is threaded now, so the one-line progress needs a lock.
+    let progress = std::sync::Mutex::new(ctx.printer.spinner("Scanning"));
+    let files = scan::large_files(&root, min, depth, &|seen, path| {
+        if let Ok(mut bar) = progress.lock() {
+            bar.done_count(seen);
+            bar.tick(&format::tilde(path));
+        }
     });
-    progress.finish();
+    if let Ok(mut bar) = progress.lock() {
+        bar.finish();
+    }
 
     let shown = take(&files, top);
 
@@ -996,6 +1293,238 @@ fn render_residue(p: &Printer, residue: &dev::Residue) {
         format::truncate_start(&format::tilde(&residue.project), 40),
         p.dim(&format!("{} · {}d", residue.language, residue.age_days))
     ));
+}
+
+// ── uninstalling ────────────────────────────────────────────────────────────
+
+/// The application bundle a name refers to, or why it cannot be decided.
+fn find_bundle(query: &str) -> Result<PathBuf, String> {
+    let bundles = scan::application_bundles();
+    let name_of = |path: &PathBuf| {
+        path.file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
+    };
+
+    // An exact name wins outright, so `Notes` never drags in `Notes Helper`.
+    if let Some(exact) = bundles
+        .iter()
+        .find(|path| name_of(path).eq_ignore_ascii_case(query))
+    {
+        return Ok(exact.clone());
+    }
+
+    let matches: Vec<&PathBuf> = bundles
+        .iter()
+        .filter(|path| name_of(path).to_lowercase().contains(&query.to_lowercase()))
+        .collect();
+
+    match matches.as_slice() {
+        [] => Err(format!("no application called `{query}`")),
+        [only] => Ok((*only).clone()),
+        several => Err(format!(
+            "`{query}` matches {}: {}",
+            several.len(),
+            several
+                .iter()
+                .map(|path| name_of(path))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
+fn uninstall(ctx: &Ctx, query: &str) -> bool {
+    let p = &ctx.printer;
+
+    let bundle = match find_bundle(query) {
+        Ok(bundle) => bundle,
+        Err(err) => {
+            p.error(err);
+            return false;
+        }
+    };
+    let name = bundle
+        .file_stem()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+
+    let Some(bundle_id) = orphans::bundle_id(&bundle) else {
+        p.error(format!(
+            "{} has no bundle identifier — refusing to guess what belongs to it",
+            format::tilde(&bundle)
+        ));
+        return false;
+    };
+
+    // Removing an application out from under itself leaves half a process
+    // running against files that no longer exist.
+    let mut progress = p.spinner("Checking what is running");
+    progress.tick(&name);
+    let snapshot = ram::snapshot(true);
+    progress.finish();
+
+    if let Some(group) = snapshot
+        .groups
+        .iter()
+        .find(|group| group.bundle.as_deref() == Some(bundle.as_path()))
+    {
+        p.error(format!(
+            "{} is running ({} process(es)) — quit it first, or: detox kill {}",
+            name,
+            group.processes.len(),
+            name.to_lowercase()
+        ));
+        return false;
+    }
+
+    let mut progress = p.spinner("Looking for what it left around");
+    progress.tick(&bundle_id);
+    let leftover = orphans::leftovers_of(&bundle_id, &bundle);
+    progress.finish();
+
+    let agents: Vec<agents::Agent> = agents::collect()
+        .into_iter()
+        .filter(|agent| {
+            !agent.apple
+                && (agent.label == bundle_id || agent.label.starts_with(&format!("{bundle_id}.")))
+        })
+        .collect();
+
+    let bundle_bytes = fsx::size_of(&bundle);
+    let total = bundle_bytes + leftover.bytes;
+
+    if !ctx.json {
+        p.heading(&format!("{name} — {}", format::size(total)));
+        p.field("Identifier", &bundle_id);
+        p.info("");
+        p.info(format!(
+            "  {:>10}  {:<14} {}",
+            format::size(bundle_bytes),
+            "application",
+            format::tilde(&bundle)
+        ));
+        for item in &leftover.items {
+            p.info(format!(
+                "  {:>10}  {:<14} {}",
+                format::size(item.bytes),
+                item.kind,
+                orphans::short(item)
+            ));
+        }
+        for agent in &agents {
+            p.info(format!(
+                "  {:>10}  {:<14} {}",
+                "", "startup agent", agent.label
+            ));
+        }
+    }
+
+    let disposal = ctx.disposal();
+    if !ctx.confirm(&format!(
+        "Remove {name} and {} other item(s) ({})?",
+        leftover.items.len() + agents.len(),
+        format::size(total)
+    )) {
+        if !ctx.json {
+            p.info("Cancelled.");
+        }
+        return false;
+    }
+    if !ctx.confirm_final(
+        &format!(
+            "{name} and its settings go{}.",
+            if disposal == Disposal::Purge {
+                " for good"
+            } else {
+                " to the trash"
+            }
+        ),
+        "delete",
+    ) {
+        if !ctx.json {
+            p.info("Cancelled.");
+        }
+        return false;
+    }
+
+    // Unload the agents before their definitions disappear.
+    for agent in &agents {
+        let _ = agents::apply(agent, Action::Remove, ctx);
+    }
+
+    let mut paths = vec![bundle.clone()];
+    paths.extend(leftover.items.iter().map(|item| item.path.clone()));
+    let removal = fsx::remove_entries(&paths, &ctx.policy());
+    record_run(ctx, &format!("uninstall {name}"), disposal, &removal);
+
+    if ctx.json {
+        emit(json!({
+            "dry_run": ctx.dry_run,
+            "application": name,
+            "bundle_id": bundle_id,
+            "disposal": disposal,
+            "freed": removal.freed,
+            "trashed": removal.trashed,
+            "removed": removal.removed,
+            "agents": agents.len(),
+        }));
+        return removal.errors.is_empty();
+    }
+
+    p.info("");
+    p.success(format!("{name} removed — {} item(s)", removal.removed));
+    for error in removal.errors.iter().take(5) {
+        p.error(error);
+    }
+    render_disposal(ctx, removal.freed, removal.trashed);
+    removal.errors.is_empty()
+}
+
+// ── scheduling ──────────────────────────────────────────────────────────────
+
+fn schedule(ctx: &Ctx, when: Option<schedule::Cadence>, targets: &[TargetArg], at: u32) -> bool {
+    let p = &ctx.printer;
+
+    let Some(cadence) = when else {
+        // No verb: just say what is set up.
+        let current = schedule::current();
+        if ctx.json {
+            emit(json!({ "scheduled": current }));
+            return true;
+        }
+        p.heading("Scheduled cleanup");
+        match current {
+            Some(summary) => {
+                p.item(summary);
+                p.info("");
+                p.info(p.dim(&format!("  {}", format::tilde(&schedule::plist_path()))));
+                p.info(p.dim("  detox schedule off   removes it"));
+            }
+            None => {
+                p.item(p.dim("nothing is scheduled"));
+                p.info("");
+                p.info(p.dim("  detox schedule weekly -t cache logs pkg-cache"));
+            }
+        }
+        return true;
+    };
+
+    let chosen = if targets.is_empty() {
+        vec![Target::Cache, Target::Logs]
+    } else {
+        TargetArg::expand(targets)
+    };
+
+    if at > 23 {
+        p.error("the hour must be between 0 and 23");
+        return false;
+    }
+
+    let outcome = schedule::apply(cadence, &chosen, at, ctx);
+    render_outcomes(ctx, std::slice::from_ref(&outcome))
 }
 
 // ── leftovers of uninstalled applications ───────────────────────────────────
@@ -1834,6 +2363,7 @@ fn sys(ctx: &Ctx, command: SysCommand) -> bool {
         SysCommand::Spotlight => "Rebuild the Spotlight index?",
         SysCommand::Memory => "Free inactive memory?",
         SysCommand::Snapshots => "Purge local Time Machine snapshots?",
+        SysCommand::Simulators => "Delete every simulator whose runtime is gone?",
         SysCommand::Updates => "",
     };
 
@@ -1851,6 +2381,7 @@ fn sys(ctx: &Ctx, command: SysCommand) -> bool {
         SysCommand::Spotlight => maintenance::reindex_spotlight(ctx),
         SysCommand::Memory => maintenance::purge_memory(ctx),
         SysCommand::Snapshots => maintenance::thin_snapshots(ctx),
+        SysCommand::Simulators => maintenance::prune_simulators(ctx),
         SysCommand::Updates => maintenance::check_updates(),
     };
     progress.finish();

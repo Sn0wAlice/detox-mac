@@ -27,15 +27,18 @@ detox undo          # actually, no
 | `apps` | Installed applications, largest first |
 | `files large` | Large files under a directory |
 | `files dev` | Build residue of local projects (`target`, `node_modules`…) |
+| `files downloads` | Installers and archives you downloaded and never opened |
 | `files clean` | Remove that residue, past a given age |
 | `ram` | Processes grouped by parent application, sorted by memory |
 | `inspect <target>` | Process tree of one application, with CPU, age and arguments |
 | `kill <target>` | Stop every process of one application (by name or number) |
 | `orphans` | Leftovers of applications that are no longer installed |
+| `uninstall <app>` | Remove an application **and** everything it left behind |
+| `schedule <daily\|weekly\|off>` | Run a cleanup on its own, through `launchd` |
 | `history` | What was removed, when, and whether it can come back |
 | `undo [ID]` | Put back what a run moved to the trash |
 | `agents list\|disable\|enable\|remove` | Startup agents and daemons (`launchd`) |
-| `sys dns\|spotlight\|memory\|snapshots\|updates` | One-off system operations |
+| `sys dns\|spotlight\|memory\|snapshots\|simulators\|updates` | One-off system operations |
 | `completions <shell>` | bash / zsh / fish / elvish / powershell completions |
 
 ### Cleaning targets
@@ -54,6 +57,7 @@ detox undo          # actually, no
 | `trash-all` | `~/.Trash` plus your own trash on every mounted volume | your data |
 | `simulators` | iOS simulator devices — **left out of `all`** | a download |
 | `ios-backups` | Local iPhone and iPad backups — **left out of `all`** | your data |
+| `vm` | Colima, Lima, Podman, VirtualBox, Vagrant, Parallels images — **left out of `all`** | your data |
 | `all` | Every target above except `simulators` and `ios-backups` |  |
 
 The last column is not decoration: `scan` sorts by it, so the free wins come
@@ -100,6 +104,10 @@ Requires macOS and Rust 1.85+ (2024 edition).
 | `--purge` | Delete for good instead of moving to the trash |
 | `-x`, `--exclude <GLOB>` | Never touch paths matching this glob (repeatable) |
 | `--no-config` | Ignore the configuration file |
+
+`scan` and `clean` also take `-o`, `--older-than <DAYS>`, which leaves alone
+anything touched more recently than that. A cache an application is using
+right now is not reclaimable in any useful sense.
 | `-q`, `--quiet` | Print warnings and errors only |
 | `--json` | JSON on stdout, for scripts |
 | `--color <auto\|always\|never>` | Colour (also honours `NO_COLOR`) |
@@ -131,6 +139,16 @@ detox orphans --clean
 detox history
 detox undo
 
+# The applications you never open, then remove one properly
+detox apps --unused 180
+detox uninstall "Screen Studio"
+
+# Installers rotting in ~/Downloads
+detox files downloads
+
+# Have it run itself, every Sunday at 3am
+detox schedule weekly -t cache logs pkg-cache
+
 # See what a full cleanup would free
 detox clean all --dry-run
 
@@ -158,6 +176,24 @@ detox sys snapshots
 detox sys updates
 ```
 
+### Speed
+
+The walk is spread over a few threads pulling from one shared pile of
+directories, rather than splitting only the top level — a home directory is
+never balanced, and splitting the top of it leaves most threads idle. On this
+machine the `.DS_Store` sweep went from 18.6 s to 6.3 s that way.
+
+A `clean` that follows a `scan` within ten minutes reuses the figures the scan
+already paid for, entry by entry, and only re-measures what has been touched
+since. That turns the second disk walk into a file read:
+
+```
+$ detox clean pkg-cache -n     # cold
+0.41s
+$ detox scan pkg-cache && detox clean pkg-cache -n
+0.004s
+```
+
 ### What the numbers mean
 
 Sizes are the **blocks the files occupy**, not their apparent length — the same
@@ -169,9 +205,19 @@ sounds:
 - a file reachable through several **hard links** is counted once, which is the
   difference between a plausible number and a wild one on a pnpm or npm store.
 
+iCloud files that have been **evicted** from the disk are recognised (by the
+`SF_DATALESS` flag, or the `.icloud` placeholder) and left out of every total:
+they take no space here, and deleting one would remove the real file from
+iCloud, on every device.
+
 APFS **clones** are the one case that cannot be detected: two files sharing
 their blocks after a copy-on-write copy each report their full size, and no
 per-file API says otherwise. That is a known overstatement, not a silent one.
+
+After a cleanup, the free space is read again and the difference printed next
+to what was announced. It is the line that keeps the rest of the tool honest —
+a measurement bug, a clone or purgeable space shows up here as a gap instead of
+hiding behind a confident total.
 
 A directory that cannot be read is **never counted as empty**. It is reported,
 and the totals say how many were missed:
@@ -409,6 +455,17 @@ emptying the trash into the trash is not a thing.
 Files on another volume cannot be moved to the user's trash; rather than
 silently deleting them, the tool says so and points at `--purge`.
 
+### Before it starts
+
+Emptying the cache of a running application ranges from harmless to a corrupted
+profile. The memory snapshot already knows who is running, so `clean` crosses
+the two and says so:
+
+```
+! 3 running application(s) will lose their cache: Slack, Spotify, Visual Studio Code
+! quit them first if you would rather not find out what that does.
+```
+
 ### Asking twice
 
 A confirmation before any destructive operation, as before — and a **second,
@@ -486,6 +543,11 @@ default_targets = ["cache", "logs", "pkg-cache"]
 
 # Ask a second time before anything irreversible. Default: true.
 confirm_twice = true
+
+# Leave alone anything touched in the last N days. Default: 0 (everything).
+# 30 is a good value for a scheduled run: it is what macOS itself uses to
+# empty the trash.
+min_age_days = 0
 ```
 
 A line the parser cannot make sense of is **reported and ignored**, never
@@ -534,6 +596,96 @@ Places searched: `Application Support`, `Containers`, `Group Containers`,
 
 ---
 
+## 🗑️ Uninstalling
+
+The active side of `orphans`: take the application *and* what it scattered
+around.
+
+```bash
+detox uninstall "Tor Browser"
+detox uninstall spotify -n          # see what would go
+```
+
+```
+Tor Browser — 479.6 MB
+  Identifier       org.torproject.torbrowser
+
+    479.6 MB  application    /Applications/Tor Browser.app
+        4 KB  preferences    ~/Library/Preferences/org.torproject.torbrowser.plist
+```
+
+- An exact name wins outright, so `Notes` never drags in `Notes Helper`; an
+  ambiguous one is refused with the list of candidates.
+- A **running** application is refused, not killed: removing it out from under
+  itself leaves half a process working against files that no longer exist.
+- Its `launchd` agents are unloaded before their definitions disappear.
+- Everything goes to the trash like any other deletion, and `undo` puts it back.
+
+Which application to remove is the other half of the question:
+
+```bash
+detox apps --unused 180
+```
+
+```
+Applications untouched for 180 day(s) (24 — 5.51 GB)
+    696.0 MB  Google Chrome Canary               never opened
+    543.1 MB  Screen Studio                      never opened
+    481.8 MB  Telegram Lite                      never opened
+```
+
+Size alone says which application is big. Size next to the last time it was
+opened — Spotlight's `kMDItemLastUsedDate`, not the modification time — says
+which one to actually remove.
+
+---
+
+## 📥 Downloads
+
+The same idea, applied to the folder everything lands in:
+
+```bash
+detox files downloads                      # installers untouched for 180 days
+detox files downloads --older-than 30
+detox files downloads --all                # every file, not only installers
+detox files downloads --clean
+```
+
+```
+In ~/Downloads, untouched for 180 day(s) (10 — 12.85 GB)
+    1.    9.61 GB  ~/Downloads/cryptmark                            221d
+    2.    2.57 GB  ~/Downloads/Telegram Lite                        190d
+```
+
+The age is the last time the file was **opened**, which is the question. A
+modification time only knows when it was downloaded, and an installer is
+written once whether it was ever run or not.
+
+---
+
+## ⏰ Scheduling
+
+The tool already loads and unloads other people's startup agents. This is it
+doing the same for itself.
+
+```bash
+detox schedule                              # what is scheduled
+detox schedule weekly -t cache logs pkg-cache
+detox schedule daily --at 4
+detox schedule off
+```
+
+A scheduled run answers its own confirmations, so the second gate never gets a
+chance to protect anything. That shapes what it is allowed to do:
+
+- targets that hold **data** are refused — `trash`, `ios-backups`, `vm`;
+- `--purge` cannot be scheduled: an unattended run stays undoable;
+- it writes to `~/.local/state/detox-mac/schedule.log`, and every run still
+  lands in the journal, so `detox history` covers what happened while you were
+  away.
+
+---
+
 ## 🏗️ Architecture
 
 ```
@@ -547,6 +699,7 @@ src/
 ├── sys/               # System access
 │   ├── cmd.rs         #   Running external commands
 │   ├── fsx.rs         #   Measuring, walking, trashing and removing files
+│   ├── par.rs         #   A work pile a few threads pull from
 │   └── machine.rs     #   Machine info (sw_vers, sysctl, vm_stat, df)
 └── task/              # Business logic, independent of display
     ├── clean.rs       #   Cleaning targets: measure and remove
@@ -554,6 +707,8 @@ src/
     ├── docker.rs      #   Docker detection and prunes
     ├── orphans.rs     #   Leftovers of uninstalled applications
     ├── journal.rs     #   What was removed, and how to put it back
+    ├── sizes.rs       #   Figures a recent scan already paid for
+    ├── schedule.rs    #   Running a cleanup on its own, through launchd
     ├── agents.rs      #   launchd startup agents
     ├── maintenance.rs #   DNS, Spotlight, memory, snapshots, updates
     ├── ram.rs         #   Memory snapshot, grouping, inspection, shutdown

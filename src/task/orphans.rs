@@ -107,7 +107,7 @@ fn collect_bundles(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
 }
 
 /// Reads `CFBundleIdentifier` out of a bundle, binary plist or not.
-fn bundle_id(bundle: &Path) -> Option<String> {
+pub fn bundle_id(bundle: &Path) -> Option<String> {
     let plist = bundle.join("Contents/Info.plist");
     if !plist.is_file() {
         return None;
@@ -271,6 +271,53 @@ pub fn find(installed_ids: &[String], progress: &mut impl FnMut(&str)) -> Vec<Le
 
     leftovers.sort_by_key(|leftover| std::cmp::Reverse(leftover.bytes));
     leftovers
+}
+
+/// Everything one bundle identifier left behind, whether or not the
+/// application is still installed.
+///
+/// Used by `uninstall`, where the identifier is known and the question is not
+/// "is this an orphan?" but "what else belongs to it?".
+pub fn leftovers_of(bundle_id: &str, exclude_bundle: &Path) -> Leftover {
+    let mut items = Vec::new();
+    let mut sizer = fsx::Sizer::new();
+
+    for (kind, dir, extension) in haunts() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == exclude_bundle {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+
+            let stem = match extension {
+                None => name.clone(),
+                Some(wanted) => match name.strip_suffix(&format!(".{wanted}")) {
+                    Some(stem) => stem.to_string(),
+                    None => continue,
+                },
+            };
+
+            let candidate = canonical_id(&stem);
+            // The identifier itself, and anything belonging to it.
+            if candidate != bundle_id && !candidate.starts_with(&format!("{bundle_id}.")) {
+                continue;
+            }
+
+            let bytes = sizer.size_of(&path);
+            items.push(Item { kind, path, bytes });
+        }
+    }
+
+    Leftover {
+        bundle_id: bundle_id.to_string(),
+        bytes: items.iter().map(|item| item.bytes).sum(),
+        items,
+    }
 }
 
 /// What removing a leftover did.

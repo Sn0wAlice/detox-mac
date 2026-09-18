@@ -9,6 +9,8 @@ pub mod maintenance;
 pub mod orphans;
 pub mod ram;
 pub mod scan;
+pub mod schedule;
+pub mod sizes;
 
 use serde::Serialize;
 
@@ -27,6 +29,8 @@ pub struct Ctx {
     pub json: bool,
     /// Remove for good instead of moving to the trash.
     pub purge: bool,
+    /// Leave alone anything touched more recently than this many days.
+    pub min_age_days: u64,
     /// Exclusions, defaults and safety settings.
     pub config: Config,
     pub printer: Printer,

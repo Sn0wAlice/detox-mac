@@ -3,3 +3,4 @@
 pub mod cmd;
 pub mod fsx;
 pub mod machine;
+pub mod par;
