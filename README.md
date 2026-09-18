@@ -23,6 +23,7 @@ detox-mac clean all     # on y va
 | `scan [CIBLE…]` | Mesure l'espace récupérable, **sans jamais rien supprimer** |
 | `clean <CIBLE…>` | Nettoie une ou plusieurs cibles (`all` pour tout) |
 | `ram` | Processus regroupés par application mère, triés par mémoire |
+| `inspect <cible>` | Arbre des processus d'une application, avec CPU, âge et arguments |
 | `kill <cible>` | Arrête tous les processus d'une application (nom ou numéro) |
 | `apps` | Applications installées, de la plus lourde à la plus légère |
 | `files` | Fichiers volumineux du dossier personnel |
@@ -85,6 +86,37 @@ Processus hors macOS (21 groupe(s) — 7.36 Go)
   qu'on le leur ait demandé. On les coupe avec `detox-mac agents disable <label>`.
 - La mémoire affichée est l'empreinte réelle (`top`), celle du Moniteur
   d'activité ; `ps` sert de repli si elle n'est pas disponible.
+
+### Comprendre ce que fait une application
+
+```bash
+detox-mac inspect 2            # le 2e groupe du dernier detox-mac ram
+detox-mac inspect spotify      # par nom
+detox-mac inspect claude       # « claude » (CLI) et « Claude » (app) restent distincts
+detox-mac inspect spotify -s   # sans les lignes de commande
+```
+
+```
+Little Snitch
+  Bundle           /Applications/Little Snitch.app
+  Mémoire          90.0 Mo — 1 processus
+  CPU moyen        3.0 % (moyenne depuis le lancement)
+  Utilisateur      alice
+  Démarrage auto   at.obdev.littlesnitch.agent
+
+     90.0 Mo  Little Snitch Agent [3877]                     3.0 % · 3 j 0 h
+
+  detox-mac agents disable at.obdev.littlesnitch.agent   empêche le lancement automatique
+```
+
+L'arbre suit la filiation réelle des processus : on voit d'un coup d'œil qui a
+lancé quoi, et les arguments (`--type=renderer`, `--type=gpu-process`…) disent
+à quoi sert chaque helper. Quand l'application est lancée par un agent
+`launchd`, son label est affiché avec la commande pour la désactiver.
+
+Le `%` est la moyenne CPU depuis le lancement du processus (celle de `ps`), pas
+une mesure instantanée : c'est ce qui trahit un processus d'arrière-plan qui
+travaille en continu.
 
 ### Arrêter une application entière
 
@@ -160,7 +192,8 @@ detox-mac clean all --dry-run
 # Ce qui occupe la RAM, avec le détail des processus
 detox-mac ram --detail --top 5
 
-# Couper une application qui traîne
+# Comprendre puis couper une application qui traîne
+detox-mac inspect discord
 detox-mac kill discord
 
 # Les 30 plus grosses applications
@@ -188,6 +221,7 @@ detox-mac completions zsh > ~/.zsh/completions/_detox-mac
 
 ```bash
 detox-mac ram --json | jq '.groups[] | select(.autostart) | .name'
+detox-mac inspect spotify --json | jq '.group.processes[].args'
 detox-mac scan all --json | jq '.total'
 detox-mac agents list --json | jq '.agents[] | select(.apple == false) | .label'
 ```
@@ -243,7 +277,7 @@ src/
     ├── clean.rs       #   Cibles de nettoyage : mesure et suppression
     ├── docker.rs      #   Détection Docker et purges
     ├── agents.rs      #   Agents de démarrage launchd
-    ├── ram.rs         #   Photographie mémoire, regroupement, arrêt de groupe
+    ├── ram.rs         #   Photographie mémoire, regroupement, inspection, arrêt
     ├── maintenance.rs #   DNS, Spotlight, mémoire, instantanés, mises à jour
     └── scan.rs        #   Applications et gros fichiers
 ```
@@ -275,6 +309,7 @@ composable, testable.
 | Onglet *Démarrage* | `detox-mac agents <sous-commande>` |
 | Dashboard de démarrage | `detox-mac info` |
 | *(nouveau)* | `detox-mac ram` — inspection mémoire par application |
+| *(nouveau)* | `detox-mac inspect <nom>` — arbre des processus d'une application |
 | *(nouveau)* | `detox-mac kill <nom>` — arrêt d'une application entière |
 
 `ratatui` et `crossterm` ne sont plus des dépendances.

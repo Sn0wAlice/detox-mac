@@ -48,6 +48,7 @@ pub fn run(cli: Cli) -> bool {
             detail,
             min,
         } => ram(&ctx, top, all, detail, min),
+        Command::Inspect { target, short } => inspect(&ctx, &target.join(" "), short),
         Command::Kill {
             target,
             force,
@@ -471,7 +472,8 @@ fn ram(ctx: &Ctx, top: usize, all: bool, detail: bool, min: u64) -> bool {
     }
     ram::remember(shown);
     p.info("");
-    p.info(p.dim("  detox-mac kill <numéro|nom>   arrête tous les processus d'une application"));
+    p.info(p.dim("  detox-mac inspect <numéro|nom>   détaille les processus d'une application"));
+    p.info(p.dim("  detox-mac kill <numéro|nom>      arrête tous les processus d'une application"));
     if shown.iter().any(|group| group.autostart) {
         p.info(p.dim(
             "  « démarrage auto » = lancé par un agent launchd ; detox-mac agents disable <label>",
@@ -481,40 +483,191 @@ fn ram(ctx: &Ctx, top: usize, all: bool, detail: bool, min: u64) -> bool {
     true
 }
 
-// ── arrêt d'une application ─────────────────────────────────────────────────
+// ── désignation d'une application ───────────────────────────────────────────
 
-fn kill(ctx: &Ctx, query: &str, force: bool, allow_system: bool) -> bool {
-    let p = &ctx.printer;
-
-    // Un numéro renvoie au nom affiché lors du dernier `detox-mac ram`.
-    let query = match query.trim().parse::<usize>() {
+/// Traduit un numéro affiché par `ram` en nom d'application.
+fn target_query(p: &Printer, raw: &str) -> Option<String> {
+    match raw.trim().parse::<usize>() {
         Ok(index) => match ram::recall(index) {
-            Some(name) => name,
+            Some(name) => Some(name),
             None => {
                 p.error(format!(
                     "aucun groupe n° {index} en mémoire — lancez d'abord detox-mac ram"
                 ));
-                return false;
+                None
             }
         },
-        Err(_) => query.trim().to_string(),
-    };
+        Err(_) => Some(raw.trim().to_string()),
+    }
+}
 
-    let snapshot = ram::snapshot(true);
-    let group = match ram::find(&snapshot.groups, &query) {
-        ram::Lookup::One(group) => group,
+/// Retrouve le groupe visé, en expliquant l'échec le cas échéant.
+fn locate<'a>(p: &Printer, snapshot: &'a ram::Snapshot, query: &str) -> Option<&'a ram::Group> {
+    match ram::find(&snapshot.groups, query) {
+        ram::Lookup::One(group) => Some(group),
         ram::Lookup::Ambiguous(names) => {
             p.error(format!("« {query} » correspond à plusieurs applications :"));
             for name in names {
                 p.item(name);
             }
             p.item(p.dim("précisez le nom, ou utilisez le numéro affiché par detox-mac ram"));
-            return false;
+            None
         }
         ram::Lookup::None => {
             p.error(format!("aucune application nommée « {query} » ne tourne."));
-            return false;
+            None
         }
+    }
+}
+
+// ── détail d'une application ────────────────────────────────────────────────
+
+fn inspect(ctx: &Ctx, raw_query: &str, short: bool) -> bool {
+    let p = &ctx.printer;
+    let Some(query) = target_query(p, raw_query) else {
+        return false;
+    };
+
+    let snapshot = ram::snapshot(true);
+    let Some(group) = locate(p, &snapshot, &query) else {
+        return false;
+    };
+
+    let mut group = group.clone();
+    ram::with_command_lines(&mut group);
+
+    if ctx.json {
+        emit(json!({ "group": group }));
+        return true;
+    }
+
+    let cpu: f64 = group.processes.iter().map(|process| process.cpu).sum();
+
+    p.heading(&group.name);
+    if let Some(bundle) = &group.bundle {
+        p.field("Bundle", format::tilde(bundle));
+    }
+    p.field(
+        "Mémoire",
+        format!(
+            "{} — {} processus",
+            format::size(group.bytes),
+            group.processes.len()
+        ),
+    );
+    p.field(
+        "CPU moyen",
+        format!("{cpu:.1} % (moyenne depuis le lancement)"),
+    );
+    if let Some(process) = group.processes.first() {
+        p.field("Utilisateur", &process.user);
+    }
+    if !group.agents.is_empty() {
+        p.field("Démarrage auto", group.agents.join(", "));
+    }
+    if group.system {
+        p.field("Origine", "composant macOS / Apple");
+    }
+
+    p.info("");
+    let (roots, children) = ram::tree(&group);
+    for root in roots {
+        render_process(p, root, &children, "  ", "", short);
+    }
+
+    if !group.agents.is_empty() {
+        p.info("");
+        p.info(p.dim(&format!(
+            "  detox-mac agents disable {}   empêche le lancement automatique",
+            group.agents[0]
+        )));
+    }
+    true
+}
+
+/// Affiche un processus et sa descendance à l'intérieur du groupe.
+fn render_process(
+    p: &Printer,
+    process: &ram::Process,
+    children: &std::collections::HashMap<u32, Vec<&ram::Process>>,
+    prefix: &str,
+    connector: &str,
+    short: bool,
+) {
+    let head = format!(
+        "{prefix}{connector}{:>10}  {} [{}]",
+        format::size(process.bytes),
+        format::truncate(&process.name, 30),
+        process.pid
+    );
+    let padding = 64usize.saturating_sub(head.chars().count());
+    p.info(format!(
+        "{head}{}{}",
+        " ".repeat(padding),
+        p.dim(&format!(
+            "{:>5.1} % · {}",
+            process.cpu,
+            format::elapsed(&process.elapsed)
+        ))
+    ));
+
+    // La branche se prolonge sous les enfants, sauf après le dernier d'entre eux.
+    let continuation = match connector.chars().next() {
+        None => "  ",
+        Some('└') => "   ",
+        Some(_) => "│  ",
+    };
+    let child_prefix = format!("{prefix}{continuation}");
+
+    if !short {
+        if let Some(arguments) = process_arguments(process) {
+            p.info(format!(
+                "{child_prefix}{:>12}{}",
+                "",
+                p.dim(&format::truncate(&arguments, 88))
+            ));
+        }
+    }
+
+    let kids = children.get(&process.pid).map(Vec::as_slice).unwrap_or(&[]);
+    for (index, child) in kids.iter().enumerate() {
+        let last = index + 1 == kids.len();
+        render_process(
+            p,
+            child,
+            children,
+            &child_prefix,
+            if last { "└─ " } else { "├─ " },
+            short,
+        );
+    }
+}
+
+/// Arguments du processus, sans l'exécutable lui-même.
+fn process_arguments(process: &ram::Process) -> Option<String> {
+    let full = process.args.as_deref()?;
+    let rest = full
+        .strip_prefix(&process.path)
+        .or_else(|| full.split_once(' ').map(|(_, rest)| rest))
+        .unwrap_or_default()
+        .trim();
+
+    (!rest.is_empty()).then(|| rest.to_string())
+}
+
+// ── arrêt d'une application ─────────────────────────────────────────────────
+
+fn kill(ctx: &Ctx, query: &str, force: bool, allow_system: bool) -> bool {
+    let p = &ctx.printer;
+
+    // Un numéro renvoie au nom affiché lors du dernier `detox-mac ram`.
+    let Some(query) = target_query(p, query) else {
+        return false;
+    };
+
+    let snapshot = ram::snapshot(true);
+    let Some(group) = locate(p, &snapshot, &query) else {
+        return false;
     };
 
     if group.system && !allow_system {

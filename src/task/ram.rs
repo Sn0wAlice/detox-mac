@@ -23,6 +23,12 @@ pub struct Process {
     pub path: String,
     /// Empreinte mémoire (`top`), sinon la taille résidente (`ps`).
     pub bytes: u64,
+    /// Part de CPU moyenne depuis le lancement du processus.
+    pub cpu: f64,
+    /// Durée depuis le lancement, telle que `ps` la donne (`3-04:12:33`).
+    pub elapsed: String,
+    /// Ligne de commande complète, renseignée par `inspect` seulement.
+    pub args: Option<String>,
 }
 
 /// Un ensemble de processus rattachés à la même application.
@@ -36,6 +42,8 @@ pub struct Group {
     pub system: bool,
     /// Lancé automatiquement par un agent `launchd`.
     pub autostart: bool,
+    /// Labels des agents `launchd` qui démarrent cette application.
+    pub agents: Vec<String>,
     pub processes: Vec<Process>,
 }
 
@@ -80,7 +88,8 @@ pub fn snapshot(include_system: bool) -> Snapshot {
             bundle: anchor.bundle.clone(),
             bytes: 0,
             system: anchor.system,
-            autostart: autostart.contains(&anchor.name),
+            autostart: autostart.contains_key(&anchor.name),
+            agents: autostart.get(&anchor.name).cloned().unwrap_or_default(),
             processes: Vec::new(),
         });
         entry.bytes += process.bytes;
@@ -199,7 +208,10 @@ fn is_system(path: &str) -> bool {
 
 /// Liste les processus avec leur empreinte mémoire.
 fn running_processes() -> Vec<Process> {
-    let Ok(output) = cmd::run("ps", &["-axwwo", "pid=,ppid=,rss=,user=,comm="]) else {
+    let Ok(output) = cmd::run(
+        "ps",
+        &["-axwwo", "pid=,ppid=,rss=,%cpu=,etime=,user=,comm="],
+    ) else {
         return Vec::new();
     };
     let footprints = footprints();
@@ -208,14 +220,17 @@ fn running_processes() -> Vec<Process> {
         .stdout
         .lines()
         .filter_map(|line| {
-            let (fields, path) = split_fields(line, 4)?;
+            let (fields, path) = split_fields(line, 6)?;
             let pid: u32 = fields[0].parse().ok()?;
             let resident = fields[2].parse::<u64>().unwrap_or(0) * 1024;
 
             Some(Process {
                 pid,
                 ppid: fields[1].parse().unwrap_or(0),
-                user: fields[3].to_string(),
+                cpu: fields[3].parse().unwrap_or(0.0),
+                elapsed: fields[4].to_string(),
+                user: fields[5].to_string(),
+                args: None,
                 name: Path::new(path)
                     .file_name()
                     .unwrap_or_default()
@@ -290,21 +305,71 @@ fn free_percent() -> Option<u8> {
         .and_then(|value| value.trim().trim_end_matches('%').parse().ok())
 }
 
-/// Noms de groupes lancés automatiquement par un agent `launchd` tiers.
-fn autostart_groups() -> HashSet<String> {
-    agents::collect()
-        .iter()
-        .filter(|agent| !agent.apple)
-        .filter_map(|agent| agent_program(&agent.path))
-        .map(|program| match bundle_of(&program) {
+/// Groupes lancés automatiquement, avec le label de l'agent responsable.
+fn autostart_groups() -> HashMap<String, Vec<String>> {
+    let mut groups: HashMap<String, Vec<String>> = HashMap::new();
+
+    for agent in agents::collect().iter().filter(|agent| !agent.apple) {
+        let Some(program) = agent_program(&agent.path) else {
+            continue;
+        };
+        let name = match bundle_of(&program) {
             Some((name, _)) => name,
             None => Path::new(&program)
                 .file_name()
                 .unwrap_or_default()
                 .to_string_lossy()
                 .to_string(),
+        };
+        groups.entry(name).or_default().push(agent.label.clone());
+    }
+
+    groups
+}
+
+/// Lignes de commande complètes, par PID.
+///
+/// Séparé de la liste principale : seul `inspect` en a besoin.
+pub fn command_lines() -> HashMap<u32, String> {
+    let Ok(output) = cmd::run("ps", &["-axwwo", "pid=,args="]) else {
+        return HashMap::new();
+    };
+
+    output
+        .stdout
+        .lines()
+        .filter_map(|line| {
+            let (fields, args) = split_fields(line, 1)?;
+            Some((fields[0].parse().ok()?, args.to_string()))
         })
         .collect()
+}
+
+/// Complète un groupe avec la ligne de commande de chacun de ses processus.
+pub fn with_command_lines(group: &mut Group) {
+    let lines = command_lines();
+    for process in &mut group.processes {
+        process.args = lines.get(&process.pid).cloned();
+    }
+}
+
+/// Arbre parent → enfants à l'intérieur d'un groupe.
+///
+/// Les racines sont les processus dont le parent est hors du groupe.
+pub fn tree(group: &Group) -> (Vec<&Process>, HashMap<u32, Vec<&Process>>) {
+    let pids: HashSet<u32> = group.processes.iter().map(|p| p.pid).collect();
+    let mut roots = Vec::new();
+    let mut children: HashMap<u32, Vec<&Process>> = HashMap::new();
+
+    for process in &group.processes {
+        if pids.contains(&process.ppid) {
+            children.entry(process.ppid).or_default().push(process);
+        } else {
+            roots.push(process);
+        }
+    }
+
+    (roots, children)
 }
 
 /// Exécutable lancé par un agent, lu depuis son fichier `.plist`.
@@ -341,9 +406,13 @@ pub enum Lookup<'a> {
 type Matcher = fn(&str, &str) -> bool;
 
 /// Du plus strict au plus permissif.
-const MATCHERS: [Matcher; 3] = [
-    |name, query| name.to_lowercase() == query,
-    |name, query| name.to_lowercase().contains(query),
+///
+/// La casse compte au premier tour : c'est ce qui distingue l'application
+/// `Claude` de l'exécutable `claude`, et rend les numéros de `ram` fiables.
+const MATCHERS: [Matcher; 4] = [
+    |name, query| name == query,
+    |name, query| name.to_lowercase() == query.to_lowercase(),
+    |name, query| name.to_lowercase().contains(&query.to_lowercase()),
     matches_words,
 ];
 
@@ -352,12 +421,12 @@ const MATCHERS: [Matcher; 3] = [
 /// Par ordre de priorité : nom exact, nom contenant la requête, puis
 /// correspondance mot à mot (`vs code` retrouve `Visual Studio Code`).
 pub fn find<'a>(groups: &'a [Group], query: &str) -> Lookup<'a> {
-    let needle = query.trim().to_lowercase();
+    let needle = query.trim();
 
     for matches in MATCHERS {
         let found: Vec<&Group> = groups
             .iter()
-            .filter(|group| matches(&group.name, &needle))
+            .filter(|group| matches(&group.name, needle))
             .collect();
 
         match found.len() {
@@ -570,6 +639,29 @@ mod tests {
             path,
             "/Applications/Claude.app/Contents/MacOS/Claude Helper (Renderer)"
         );
+    }
+
+    fn group(name: &str) -> Group {
+        Group {
+            name: name.to_string(),
+            bundle: None,
+            bytes: 0,
+            system: false,
+            autostart: false,
+            agents: Vec::new(),
+            processes: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn exact_case_wins_over_fuzzy_matches() {
+        let groups = [group("Claude"), group("claude"), group("Discord")];
+
+        assert!(matches!(find(&groups, "Claude"), Lookup::One(g) if g.name == "Claude"));
+        assert!(matches!(find(&groups, "claude"), Lookup::One(g) if g.name == "claude"));
+        assert!(matches!(find(&groups, "disc"), Lookup::One(g) if g.name == "Discord"));
+        assert!(matches!(find(&groups, "CLAUDE"), Lookup::Ambiguous(_)));
+        assert!(matches!(find(&groups, "firefox"), Lookup::None));
     }
 
     #[test]

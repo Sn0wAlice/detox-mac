@@ -180,6 +180,17 @@ pub enum Command {
         min: u64,
     },
 
+    /// Détailler les processus d'une application.
+    Inspect {
+        /// Nom de l'application, ou numéro affiché par `detox-mac ram`.
+        #[arg(value_name = "CIBLE", required = true, num_args = 1..)]
+        target: Vec<String>,
+
+        /// Masquer les lignes de commande.
+        #[arg(short, long)]
+        short: bool,
+    },
+
     /// Arrêter tous les processus d'une application.
     Kill {
         /// Nom de l'application, ou numéro affiché par `detox-mac ram`.

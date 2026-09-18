@@ -59,6 +59,31 @@ pub fn tilde(path: &std::path::Path) -> String {
     }
 }
 
+/// Met en forme une durée `ps` (`3-04:12:33`, `04:12:33`, `12:33`).
+pub fn elapsed(raw: &str) -> String {
+    let (days, clock) = match raw.split_once('-') {
+        Some((days, clock)) => (days.parse::<u64>().unwrap_or(0), clock),
+        None => (0, raw),
+    };
+
+    let parts: Vec<u64> = clock
+        .split(':')
+        .map(|part| part.parse().unwrap_or(0))
+        .collect();
+
+    let (hours, minutes) = match parts.as_slice() {
+        [hours, minutes, _] => (*hours, *minutes),
+        [minutes, _] => (0, *minutes),
+        _ => return raw.to_string(),
+    };
+
+    match (days, hours, minutes) {
+        (0, 0, minutes) => format!("{minutes} min"),
+        (0, hours, minutes) => format!("{hours} h {minutes:02}"),
+        (days, hours, _) => format!("{days} j {hours} h"),
+    }
+}
+
 /// Tronque un texte trop long pour sa colonne, avec une ellipse.
 pub fn truncate(text: &str, width: usize) -> String {
     if text.chars().count() <= width {
@@ -93,6 +118,14 @@ mod tests {
     fn truncates_only_when_needed() {
         assert_eq!(truncate("Docker", 10), "Docker");
         assert_eq!(truncate("at.obdev.littlesnitch.daemon", 12), "at.obdev.li…");
+    }
+
+    #[test]
+    fn formats_elapsed_times() {
+        assert_eq!(elapsed("12:33"), "12 min");
+        assert_eq!(elapsed("04:12:33"), "4 h 12");
+        assert_eq!(elapsed("3-04:12:33"), "3 j 4 h");
+        assert_eq!(elapsed("bizarre"), "bizarre");
     }
 
     #[test]
