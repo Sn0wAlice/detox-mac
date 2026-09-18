@@ -95,6 +95,97 @@ pub fn truncate_start(text: &str, width: usize) -> String {
     format!("…{kept}")
 }
 
+/// Seconds since the Unix epoch, now.
+pub fn epoch_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0)
+}
+
+/// Offset of the local timezone, in seconds east of UTC.
+///
+/// Read once from `date`, which is the only thing on the system that already
+/// knows the user's timezone rules.
+fn local_offset() -> i64 {
+    use std::sync::OnceLock;
+    static OFFSET: OnceLock<i64> = OnceLock::new();
+
+    *OFFSET.get_or_init(|| {
+        let Ok(output) = crate::sys::cmd::run("date", &["+%z"]) else {
+            return 0;
+        };
+        // `+0200`, `-0730`.
+        let raw = output.stdout.trim();
+        let (sign, digits) = match raw.strip_prefix('-') {
+            Some(rest) => (-1, rest),
+            None => (1, raw.trim_start_matches('+')),
+        };
+        if digits.len() < 4 {
+            return 0;
+        }
+        let hours: i64 = digits[..2].parse().unwrap_or(0);
+        let minutes: i64 = digits[2..4].parse().unwrap_or(0);
+        sign * (hours * 3600 + minutes * 60)
+    })
+}
+
+/// Splits a local timestamp into `(year, month, day, hour, minute, second)`.
+fn civil(epoch: u64) -> (i64, u32, u32, u32, u32, u32) {
+    let local = epoch as i64 + local_offset();
+    let days = local.div_euclid(86_400);
+    let seconds = local.rem_euclid(86_400);
+
+    // Howard Hinnant's civil-from-days, shifted to a March-based year so that
+    // the leap day lands at the end.
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let year = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = if month <= 2 { year + 1 } else { year };
+
+    (
+        year,
+        month,
+        day,
+        (seconds / 3600) as u32,
+        (seconds % 3600 / 60) as u32,
+        (seconds % 60) as u32,
+    )
+}
+
+/// A timestamp a human reads: `2026-09-18 23:05`.
+pub fn datetime(epoch: u64) -> String {
+    let (year, month, day, hour, minute, _) = civil(epoch);
+    format!("{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}")
+}
+
+/// A timestamp that sorts and makes a filename: `20260918-230512`.
+pub fn stamp(epoch: u64) -> String {
+    let (year, month, day, hour, minute, second) = civil(epoch);
+    format!("{year:04}{month:02}{day:02}-{hour:02}{minute:02}{second:02}")
+}
+
+/// How long ago, in words: `3 days ago`, `just now`.
+pub fn since(epoch: u64) -> String {
+    let now = epoch_now();
+    let seconds = now.saturating_sub(epoch);
+    match seconds {
+        0..=59 => "just now".to_string(),
+        60..=3599 => format!("{} min ago", seconds / 60),
+        3600..=86_399 => format!("{}h ago", seconds / 3600),
+        _ => {
+            let days = seconds / 86_400;
+            format!("{days} day{} ago", if days == 1 { "" } else { "s" })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

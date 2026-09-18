@@ -11,6 +11,11 @@ readme = "README.md"
 keywords = ["macos", "cleaner", "maintenance", "cli"]
 categories = ["command-line-utilities"]
 
+# The crate is `detox-mac`; the command you type is `detox`.
+[[bin]]
+name = "detox"
+path = "src/main.rs"
+
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
 clap_complete = "4.6"

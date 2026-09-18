@@ -8,22 +8,40 @@ use serde_json::{Value, json};
 use crate::cli::{
     AgentCommand, Cli, Command, DevFilter, FileCommand, Selection, SysCommand, TargetArg,
 };
+use crate::config::Config;
 use crate::format;
-use crate::sys::fsx;
+use crate::sys::fsx::{self, Disposal};
 use crate::sys::machine::Machine;
 use crate::task::agents::{self, Action, Agent, Scope};
 use crate::task::clean::{self, Target};
-use crate::task::{Ctx, Outcome, Status, dev, maintenance, ram, scan};
+use crate::task::{Ctx, Outcome, Status, dev, journal, maintenance, orphans, ram, scan};
 use crate::ui::Printer;
 
 /// Runs the requested command. Returns `false` when something failed.
 pub fn run(cli: Cli) -> bool {
     let options = cli.options;
     let printer = Printer::new(options.color, options.quiet || options.json);
+
+    let mut config = if options.no_config {
+        Config::default()
+    } else {
+        Config::load()
+    };
+    // Exclusions given on the command line add to the configured ones; one
+    // never replaces the other, so a `-x` can only ever protect more.
+    config.exclude.extend(&options.exclude);
+
+    // A setting that could not be read is announced, never quietly ignored.
+    for problem in &config.problems {
+        printer.warn(format!("{}: {problem}", format::tilde(&Config::path())));
+    }
+
     let ctx = Ctx {
         dry_run: options.dry_run,
         yes: options.yes,
         json: options.json,
+        purge: options.purge,
+        config,
         printer,
     };
 
@@ -33,8 +51,10 @@ pub fn run(cli: Cli) -> bool {
 
     match cli.command {
         Command::Info => info(&ctx),
-        Command::Scan { targets } => scan_targets(&ctx, resolve(&targets, &Target::QUICK)),
-        Command::Clean { targets } => clean_targets(&ctx, resolve(&targets, &Target::DEFAULT)),
+        Command::Scan { targets } => scan_targets(&ctx, resolve(&ctx, &targets, &Target::QUICK)),
+        Command::Clean { targets } => {
+            clean_targets(&ctx, resolve(&ctx, &targets, &Target::DEFAULT))
+        }
         Command::Apps { top } => apps(&ctx, top),
         Command::Files { command } => match command {
             FileCommand::Large {
@@ -43,8 +63,12 @@ pub fn run(cli: Cli) -> bool {
                 path,
                 depth,
             } => large_files(&ctx, min, top, path, depth),
-            FileCommand::Dev { filter, top } => dev_residue(&ctx, &filter, top, None),
-            FileCommand::Clean { filter, native } => dev_residue(&ctx, &filter, 0, Some(native)),
+            FileCommand::Dev { filter, top } => dev_residue(&ctx, &filter, top, None, false),
+            FileCommand::Clean {
+                filter,
+                native,
+                all,
+            } => dev_residue(&ctx, &filter, 0, Some(native), all),
         },
         Command::Ram {
             top,
@@ -58,6 +82,9 @@ pub fn run(cli: Cli) -> bool {
             force,
             system,
         } => kill(&ctx, &target.join(" "), force, system),
+        Command::Orphans { clean, only, top } => leftovers(&ctx, clean, &only, top),
+        Command::History { top } => history(&ctx, top),
+        Command::Undo { id } => undo_run(&ctx, id.as_deref()),
         Command::Agents { command } => match command {
             AgentCommand::List { third_party, scope } => list_agents(&ctx, third_party, scope),
             AgentCommand::Disable { selection } => act_on_agents(&ctx, Action::Disable, selection),
@@ -75,15 +102,44 @@ pub fn run(cli: Cli) -> bool {
 }
 
 /// The requested targets, or the default selection when none were given.
-fn resolve(targets: &[TargetArg], fallback: &[Target]) -> Vec<Target> {
-    if targets.is_empty() {
+///
+/// The configuration file can override that default; anything it names that
+/// is not a target is reported rather than skipped.
+fn resolve(ctx: &Ctx, targets: &[TargetArg], fallback: &[Target]) -> Vec<Target> {
+    if !targets.is_empty() {
+        return TargetArg::expand(targets);
+    }
+
+    if ctx.config.default_targets.is_empty() {
+        return fallback.to_vec();
+    }
+
+    let mut chosen = Vec::new();
+    for slug in &ctx.config.default_targets {
+        match Target::from_slug(slug) {
+            Some(target) if !chosen.contains(&target) => chosen.push(target),
+            Some(_) => {}
+            None => ctx
+                .printer
+                .warn(format!("unknown target in your configuration: `{slug}`")),
+        }
+    }
+
+    if chosen.is_empty() {
         fallback.to_vec()
     } else {
-        TargetArg::expand(targets)
+        chosen
     }
 }
 
-fn emit(value: Value) {
+/// Shape of the JSON output. Bumped whenever a field changes meaning, so a
+/// script can tell what it is reading.
+const SCHEMA: u32 = 2;
+
+fn emit(mut value: Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.insert("schema".to_string(), json!(SCHEMA));
+    }
     match serde_json::to_string_pretty(&value) {
         Ok(text) => println!("{text}"),
         Err(err) => eprintln!("JSON error: {err}"),
@@ -190,38 +246,105 @@ fn info(ctx: &Ctx) -> bool {
         "Agents",
         format!("{third_party} third-party, {apple} Apple"),
     );
+
+    p.heading("Safety");
+    p.field(
+        "Deletions",
+        match ctx.disposal() {
+            Disposal::Trash => "moved to the trash, undoable",
+            Disposal::Purge => "permanent (--purge)",
+        },
+    );
+    if ctx.config.exclude.is_empty() {
+        p.field(
+            "Protected",
+            ctx.printer.dim("nothing — see the config file"),
+        );
+    } else {
+        p.field(
+            "Protected",
+            format!(
+                "{} pattern(s): {}",
+                ctx.config.exclude.patterns().len(),
+                format::truncate(&ctx.config.exclude.patterns().join(", "), 48)
+            ),
+        );
+    }
+    p.field(
+        "Config",
+        match &ctx.config.source {
+            Some(path) => format::tilde(path),
+            None => format!("{} (absent)", format::tilde(&Config::path())),
+        },
+    );
+
     p.info("");
-    p.info(p.dim("  detox-mac ram         see what is eating memory"));
-    p.info(p.dim("  detox-mac files dev   find build residue in your projects"));
-    p.info(p.dim("  detox-mac scan all    measure everything"));
-    p.info(p.dim("  detox-mac clean all   clean everything"));
+    p.info(p.dim("  detox ram         see what is eating memory"));
+    p.info(p.dim("  detox files dev   find build residue in your projects"));
+    p.info(p.dim("  detox scan all    measure everything"));
+    p.info(p.dim("  detox clean all   clean everything"));
     true
 }
 
 // ── scan ────────────────────────────────────────────────────────────────────
 
 fn render_measure(p: &Printer, measure: &clean::Measure) {
-    match &measure.unavailable {
-        Some(reason) => p.info(format!(
+    if let Some(reason) = &measure.unavailable {
+        p.info(format!(
             "  {:<28} {}",
             measure.label,
             p.dim(&format!("— {reason}"))
-        )),
-        None => p.info(format!(
-            "  {:<28} {:>10}  {}",
-            measure.label,
-            format::size(measure.bytes),
-            p.dim(&format!("{} item(s)", measure.items))
-        )),
+        ));
+        return;
     }
+
+    // What it costs to lose it matters as much as how big it is.
+    let mut detail = format!("{} item(s) · {}", measure.items, measure.risk.label());
+    if measure.denied > 0 {
+        detail.push_str(&format!(" · {} unreadable", measure.denied));
+    }
+
+    p.info(format!(
+        "  {:<28} {:>10}  {}",
+        measure.label,
+        format::size(measure.bytes),
+        p.dim(&detail)
+    ));
+}
+
+/// Says so, once, when macOS is hiding part of what was asked for.
+fn warn_missing_access(ctx: &Ctx, targets: &[Target]) {
+    if ctx.json || !targets.iter().any(|t| t.needs_full_disk_access()) {
+        return;
+    }
+    if fsx::has_full_disk_access() {
+        return;
+    }
+    ctx.printer.warn(format!(
+        "some of these targets are unreadable without Full Disk Access — {}",
+        fsx::full_disk_access_hint()
+    ));
+}
+
+/// Sorts a scan so the safest and biggest wins come first.
+fn by_value(measures: &mut [clean::Measure]) {
+    measures.sort_by(|a, b| a.risk.cmp(&b.risk).then_with(|| b.bytes.cmp(&a.bytes)));
 }
 
 fn scan_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
-    let measures = measure_targets(ctx, &targets);
+    warn_missing_access(ctx, &targets);
+
+    let mut measures = measure_targets(ctx, &targets);
     let total: u64 = measures.iter().map(|measure| measure.bytes).sum();
+    let denied: usize = measures.iter().map(|measure| measure.denied).sum();
+    by_value(&mut measures);
 
     if ctx.json {
-        emit(json!({ "total": total, "targets": measures }));
+        emit(json!({
+            "total": total,
+            "unreadable": denied,
+            "targets": measures,
+        }));
         return true;
     }
 
@@ -231,14 +354,122 @@ fn scan_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
         render_measure(p, measure);
     }
     p.info(p.bold(&format!("  {:<28} {:>10}", "Total", format::size(total))));
+
+    if denied > 0 {
+        p.warn(format!(
+            "{denied} director{} could not be read — {}",
+            if denied == 1 { "y" } else { "ies" },
+            fsx::full_disk_access_hint()
+        ));
+    }
     true
 }
 
 // ── clean ───────────────────────────────────────────────────────────────────
 
+/// Second gate, for what the first `y` should not be enough to authorise.
+///
+/// Moving a cache to the trash is reversible and stops at one question.
+/// Emptying the trash, or running with `--purge`, does not.
+fn second_gate(ctx: &Ctx, targets: &[Target], disposal: Disposal) -> bool {
+    let irreversible: Vec<&str> = targets
+        .iter()
+        .filter(|target| target.is_irreversible(disposal))
+        .map(|target| target.slug())
+        .collect();
+
+    if !irreversible.is_empty() {
+        return ctx.confirm_final(
+            &format!(
+                "This cannot be undone — nothing goes to the trash: {}.",
+                irreversible.join(", ")
+            ),
+            "delete forever",
+        );
+    }
+
+    let data: Vec<&str> = targets
+        .iter()
+        .filter(|target| target.risk() == clean::Risk::Data)
+        .map(|target| target.slug())
+        .collect();
+
+    if !data.is_empty() {
+        return ctx.confirm_final(
+            &format!("These hold your own data, not cache: {}.", data.join(", ")),
+            "delete",
+        );
+    }
+
+    true
+}
+
+/// Writes what just happened to the journal, so it can be read back — and,
+/// when it went to the trash, undone.
+fn record_run(ctx: &Ctx, command: &str, disposal: Disposal, removal: &fsx::Removal) {
+    if ctx.dry_run {
+        return;
+    }
+    match journal::record(command, disposal, removal) {
+        Ok(Some(path)) => {
+            if !ctx.json {
+                ctx.printer.info(
+                    ctx.printer
+                        .dim(&format!("  journal: {}", format::tilde(&path))),
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(err) => ctx
+            .printer
+            .warn(format!("the journal could not be written: {err}")),
+    }
+}
+
+/// The closing lines of any command that removed something.
+fn render_disposal(ctx: &Ctx, freed: u64, trashed: u64) {
+    let p = &ctx.printer;
+    p.info("");
+
+    if freed > 0 || trashed == 0 {
+        p.info(format!(
+            "  {} {}",
+            if ctx.dry_run {
+                "Reclaimable:"
+            } else {
+                "Freed:"
+            },
+            p.accent(&format::size(freed))
+        ));
+    }
+
+    if trashed > 0 {
+        p.info(format!(
+            "  {} {}",
+            if ctx.dry_run {
+                "To the trash:"
+            } else {
+                "Moved to trash:"
+            },
+            p.accent(&format::size(trashed))
+        ));
+        // Saying "freed" here would be a lie: the blocks are still allocated.
+        p.info(p.dim("  Still on disk until the trash is emptied — detox clean trash"));
+        if !ctx.dry_run {
+            p.info(p.dim("  Changed your mind? detox undo"));
+        }
+    }
+}
+
 fn clean_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
+    warn_missing_access(ctx, &targets);
+
     let labels: Vec<&str> = targets.iter().map(|target| target.slug()).collect();
-    if !ctx.confirm(&format!("Clean: {}?", labels.join(", "))) {
+    let disposal = ctx.disposal();
+
+    if !ctx.confirm(&format!("Clean: {}?", labels.join(", ")))
+        || !second_gate(ctx, &targets, disposal)
+    {
         if !ctx.json {
             ctx.printer.info("Cancelled.");
         }
@@ -258,12 +489,33 @@ fn clean_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
     progress.finish();
 
     let freed: u64 = results.iter().map(|result| result.freed).sum();
+    let trashed: u64 = results.iter().map(|result| result.trashed).sum();
+    let excluded: usize = results.iter().map(|result| result.excluded).sum();
     let failed = results.iter().any(|result| result.status.is_failure());
+
+    let mut removal = fsx::Removal {
+        freed,
+        trashed,
+        removed: results.iter().map(|result| result.removed).sum(),
+        ..Default::default()
+    };
+    for result in &results {
+        removal.moves.extend(result.moves.iter().cloned());
+    }
+    record_run(
+        ctx,
+        &format!("clean {}", labels.join(" ")),
+        disposal,
+        &removal,
+    );
 
     if ctx.json {
         emit(json!({
             "dry_run": ctx.dry_run,
+            "disposal": disposal,
             "freed": freed,
+            "trashed": trashed,
+            "excluded": excluded,
             "results": results,
         }));
         return !failed;
@@ -295,7 +547,7 @@ fn clean_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
         let headline = format!(
             "{:<28} {:>10}  {}",
             result.label,
-            format::size(result.freed),
+            format::size(result.total()),
             details
         );
         let headline = headline.trim_end().to_string();
@@ -309,16 +561,12 @@ fn clean_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
         }
     }
 
-    p.info("");
-    p.info(format!(
-        "  {} {}",
-        if ctx.dry_run {
-            "Reclaimable:"
-        } else {
-            "Freed:"
-        },
-        p.accent(&format::size(freed))
-    ));
+    render_disposal(ctx, freed, trashed);
+    if excluded > 0 {
+        p.info(p.dim(&format!(
+            "  {excluded} item(s) protected by your exclusions"
+        )));
+    }
     !failed
 }
 
@@ -413,7 +661,13 @@ fn large_files(ctx: &Ctx, min: u64, top: usize, path: Option<PathBuf>, depth: us
 
 // ── build residue ───────────────────────────────────────────────────────────
 
-fn dev_residue(ctx: &Ctx, filter: &DevFilter, top: usize, remove: Option<bool>) -> bool {
+fn dev_residue(
+    ctx: &Ctx,
+    filter: &DevFilter,
+    top: usize,
+    remove: Option<bool>,
+    take_all: bool,
+) -> bool {
     let p = &ctx.printer;
     let root = filter.path.clone().unwrap_or_else(fsx::home);
 
@@ -466,6 +720,18 @@ fn dev_residue(ctx: &Ctx, filter: &DevFilter, top: usize, remove: Option<bool>) 
     sizing.finish();
     residue.sort_by_key(|entry| std::cmp::Reverse(entry.bytes));
 
+    // Protected paths never reach the list, so they can never be picked by a
+    // careless `--yes` either.
+    let before = residue.len();
+    residue.retain(|entry| !ctx.config.exclude.blocks(&entry.path));
+    let protected = before - residue.len();
+    if protected > 0 && !ctx.json {
+        p.info(p.dim(&format!(
+            "  {protected} director{} protected by your exclusions",
+            if protected == 1 { "y" } else { "ies" }
+        )));
+    }
+
     let total = dev::total(&residue);
 
     let Some(native) = remove else {
@@ -509,7 +775,7 @@ fn dev_residue(ctx: &Ctx, filter: &DevFilter, top: usize, remove: Option<bool>) 
             )));
         }
         p.info("");
-        p.info(p.dim("  detox-mac files clean   removes them (your next build rebuilds them)"));
+        p.info(p.dim("  detox files clean   removes them (your next build rebuilds them)"));
         return true;
     };
 
@@ -531,25 +797,54 @@ fn dev_residue(ctx: &Ctx, filter: &DevFilter, top: usize, remove: Option<bool>) 
             format::size(total),
             filter.older_than
         ));
-        for entry in residue.iter().take(15) {
-            render_residue(p, entry);
+        for (index, entry) in residue.iter().take(LISTED).enumerate() {
+            render_numbered_residue(p, index + 1, entry);
             if native {
                 if let Some(command) = dev::planned_command(entry) {
                     p.item(p.dim(&format!("via {command}")));
                 }
             }
         }
-        if residue.len() > 15 {
-            p.info(p.dim(&format!("  … and {} more", residue.len() - 15)));
+        if residue.len() > LISTED {
+            p.info(p.dim(&format!("  … and {} more", residue.len() - LISTED)));
         }
     }
 
+    // One project out of the fifty is the one you go back to tomorrow.
+    // Removing all or nothing was the only option before this.
+    if !take_all && !keep_some(ctx, &mut residue) {
+        if !ctx.json {
+            p.info("Cancelled.");
+        }
+        return false;
+    }
+    if residue.is_empty() {
+        if !ctx.json {
+            p.info("Nothing left to remove.");
+        }
+        return true;
+    }
+    let total = dev::total(&residue);
+
+    let disposal = ctx.disposal();
     if !ctx.confirm(&format!(
         "Remove {} director{} ({})?",
         residue.len(),
         if residue.len() == 1 { "y" } else { "ies" },
         format::size(total)
     )) {
+        if !ctx.json {
+            p.info("Cancelled.");
+        }
+        return false;
+    }
+
+    if disposal == Disposal::Purge
+        && !ctx.confirm_final(
+            "This cannot be undone — nothing goes to the trash.",
+            "delete forever",
+        )
+    {
         if !ctx.json {
             p.info("Cancelled.");
         }
@@ -568,24 +863,42 @@ fn dev_residue(ctx: &Ctx, filter: &DevFilter, top: usize, remove: Option<bool>) 
         .collect();
     progress.finish();
 
-    let freed: u64 = removed.iter().map(|entry| entry.bytes).sum();
+    let accounted: u64 = removed.iter().map(|entry| entry.bytes).sum();
+    let trashed: u64 = removed.iter().map(|entry| entry.trashed).sum();
+    let freed = accounted.saturating_sub(trashed);
     let failed = removed.iter().filter(|entry| entry.error.is_some()).count();
 
+    let mut removal = fsx::Removal {
+        freed,
+        trashed,
+        removed: removed.len() - failed,
+        ..Default::default()
+    };
+    for entry in &removed {
+        removal.moves.extend(entry.moves.iter().cloned());
+    }
+    record_run(ctx, "files clean", disposal, &removal);
+
     if ctx.json {
-        emit(json!({ "dry_run": ctx.dry_run, "freed": freed, "removed": removed }));
+        emit(json!({
+            "dry_run": ctx.dry_run,
+            "disposal": disposal,
+            "freed": freed,
+            "trashed": trashed,
+            "removed": removed,
+        }));
         return failed == 0;
     }
 
     p.info("");
     let summary = format!(
-        "{} director{} removed, {} freed",
+        "{} director{} removed",
         removed.len() - failed,
         if removed.len() - failed == 1 {
             "y"
         } else {
             "ies"
-        },
-        format::size(freed)
+        }
     );
     if ctx.dry_run {
         p.success(format!("{summary} [dry run]"));
@@ -610,7 +923,69 @@ fn dev_residue(ctx: &Ctx, filter: &DevFilter, top: usize, remove: Option<bool>) 
             entry.error.clone().unwrap_or_default()
         ));
     }
+
+    // Where those bytes actually went, and how to change your mind.
+    render_disposal(ctx, freed, trashed);
     failed == 0
+}
+
+/// How many directories are listed before the tail is summarised.
+const LISTED: usize = 50;
+
+fn render_numbered_residue(p: &Printer, number: usize, residue: &dev::Residue) {
+    p.info(format!(
+        "  {:>3}. {:>10}  {:<16} {:<40} {}",
+        number,
+        format::size(residue.bytes),
+        residue.kind,
+        format::truncate_start(&format::tilde(&residue.project), 40),
+        p.dim(&format!("{} · {}d", residue.language, residue.age_days))
+    ));
+}
+
+/// Offers to drop entries from the list before anything is removed.
+///
+/// Returns `false` when the user cancelled outright.
+fn keep_some(ctx: &Ctx, residue: &mut Vec<dev::Residue>) -> bool {
+    if ctx.json || ctx.yes || ctx.dry_run || residue.len() < 2 {
+        return true;
+    }
+
+    let shown = residue.len().min(LISTED);
+    let Some(answer) = ctx.printer.ask(&format!(
+        "Numbers to keep (e.g. 1,4-6), Enter to remove all {shown}, q to cancel:"
+    )) else {
+        // Not a terminal: the plain confirmation below still applies.
+        return true;
+    };
+
+    if answer.eq_ignore_ascii_case("q") {
+        return false;
+    }
+    if answer.is_empty() {
+        return true;
+    }
+
+    match crate::ui::parse_ranges(&answer, shown) {
+        Ok(kept) => {
+            let mut index = 0;
+            residue.retain(|_| {
+                let keep = kept.contains(&index);
+                index += 1;
+                !keep
+            });
+            ctx.printer.info(
+                ctx.printer
+                    .dim(&format!("  keeping {} director(ies)", kept.len())),
+            );
+            true
+        }
+        Err(err) => {
+            // A misread list would delete what the user meant to protect.
+            ctx.printer.error(format!("{err} — nothing was removed."));
+            false
+        }
+    }
 }
 
 fn render_residue(p: &Printer, residue: &dev::Residue) {
@@ -621,6 +996,309 @@ fn render_residue(p: &Printer, residue: &dev::Residue) {
         format::truncate_start(&format::tilde(&residue.project), 40),
         p.dim(&format!("{} · {}d", residue.language, residue.age_days))
     ));
+}
+
+// ── leftovers of uninstalled applications ───────────────────────────────────
+
+fn leftovers(ctx: &Ctx, remove: bool, only: &[String], top: usize) -> bool {
+    let p = &ctx.printer;
+
+    let mut progress = p.spinner("Reading installed applications");
+    let mut seen = 0usize;
+    let installed = orphans::installed(&mut |name| {
+        seen += 1;
+        progress.done_count(seen);
+        progress.tick(name);
+    });
+    progress.finish();
+
+    if installed.is_empty() {
+        p.error("not one application bundle could be read — refusing to guess what is an orphan");
+        return false;
+    }
+
+    let mut progress = p.spinner("Looking for leftovers");
+    let mut found = 0usize;
+    let mut leftovers = orphans::find(&installed, &mut |id| {
+        found += 1;
+        progress.done_count(found);
+        progress.tick(id);
+    });
+    progress.finish();
+
+    if !only.is_empty() {
+        leftovers.retain(|leftover| {
+            only.iter()
+                .any(|wanted| wanted.eq_ignore_ascii_case(&leftover.bundle_id))
+        });
+    }
+
+    // Protected paths leave the list entirely, item by item.
+    for leftover in &mut leftovers {
+        leftover
+            .items
+            .retain(|item| !ctx.config.exclude.blocks(&item.path));
+        leftover.bytes = leftover.items.iter().map(|item| item.bytes).sum();
+    }
+    leftovers.retain(|leftover| !leftover.items.is_empty());
+
+    let total = orphans::total(&leftovers);
+
+    if !remove {
+        let shown = take(&leftovers, top);
+
+        if ctx.json {
+            emit(json!({
+                "count": leftovers.len(),
+                "total": total,
+                "installed": installed.len(),
+                "leftovers": shown,
+            }));
+            return true;
+        }
+
+        p.heading(&format!(
+            "Leftovers of uninstalled applications ({} — {})",
+            leftovers.len(),
+            format::size(total)
+        ));
+        if leftovers.is_empty() {
+            p.item(p.dim("nothing left behind"));
+            return true;
+        }
+        for (index, leftover) in shown.iter().enumerate() {
+            render_leftover(p, index + 1, leftover);
+        }
+        if shown.len() < leftovers.len() {
+            p.info(p.dim(&format!("  … and {} more", leftovers.len() - shown.len())));
+        }
+        p.info("");
+        p.info(p.dim("  Only directories named after a bundle identifier are matched, so this"));
+        p.info(p.dim("  list is short of what is really there — and never guesses."));
+        p.info(p.dim("  detox orphans --clean   removes them"));
+        return true;
+    }
+
+    if leftovers.is_empty() {
+        if ctx.json {
+            emit(json!({ "removed": [], "freed": 0 }));
+        } else {
+            p.skipped("No leftovers to remove.");
+        }
+        return true;
+    }
+
+    if !ctx.json {
+        p.heading(&format!(
+            "{} application(s) left {} behind",
+            leftovers.len(),
+            format::size(total)
+        ));
+        for (index, leftover) in leftovers.iter().take(LISTED).enumerate() {
+            render_leftover(p, index + 1, leftover);
+            for item in &leftover.items {
+                p.item(p.dim(&format!("    {} — {}", item.kind, orphans::short(item))));
+            }
+        }
+    }
+
+    let disposal = ctx.disposal();
+    if !ctx.confirm(&format!(
+        "Remove the leftovers of {} application(s) ({})?",
+        leftovers.len(),
+        format::size(total)
+    )) {
+        if !ctx.json {
+            p.info("Cancelled.");
+        }
+        return false;
+    }
+
+    // Attribution by name is a heuristic, so this gate is asked whichever way
+    // the entries are going.
+    let warning = if disposal == Disposal::Purge {
+        "These are matched by name, and this cannot be undone."
+    } else {
+        "These are matched by name — check the list above before answering."
+    };
+    if !ctx.confirm_final(warning, "delete") {
+        if !ctx.json {
+            p.info("Cancelled.");
+        }
+        return false;
+    }
+
+    let policy = ctx.policy();
+    let mut progress = p.bar("Removing", leftovers.len());
+    let removed: Vec<orphans::Removed> = leftovers
+        .iter()
+        .map(|leftover| {
+            progress.tick(&leftover.bundle_id);
+            let outcome = orphans::remove(leftover, &policy);
+            progress.advance(&leftover.bundle_id);
+            outcome
+        })
+        .collect();
+    progress.finish();
+
+    let freed: u64 = removed.iter().map(|entry| entry.freed).sum();
+    let trashed: u64 = removed.iter().map(|entry| entry.trashed).sum();
+    let failed = removed.iter().any(|entry| !entry.errors.is_empty());
+
+    let mut removal = fsx::Removal {
+        freed,
+        trashed,
+        removed: removed.iter().map(|entry| entry.items).sum(),
+        ..Default::default()
+    };
+    for entry in &removed {
+        removal.moves.extend(entry.moves.iter().cloned());
+    }
+    record_run(ctx, "orphans --clean", disposal, &removal);
+
+    if ctx.json {
+        emit(json!({
+            "dry_run": ctx.dry_run,
+            "disposal": disposal,
+            "freed": freed,
+            "trashed": trashed,
+            "removed": removed,
+        }));
+        return !failed;
+    }
+
+    for entry in &removed {
+        for error in &entry.errors {
+            p.error(format!("{}: {error}", entry.bundle_id));
+        }
+    }
+    render_disposal(ctx, freed, trashed);
+    !failed
+}
+
+fn render_leftover(p: &Printer, number: usize, leftover: &orphans::Leftover) {
+    p.info(format!(
+        "  {:>3}. {:>10}  {:<36} {}",
+        number,
+        format::size(leftover.bytes),
+        format::truncate(&leftover.bundle_id, 36),
+        p.dim(&orphans::kinds(leftover))
+    ));
+}
+
+// ── journal ─────────────────────────────────────────────────────────────────
+
+fn history(ctx: &Ctx, top: usize) -> bool {
+    let runs = journal::list();
+    let shown = take(&runs, top);
+
+    if ctx.json {
+        emit(json!({ "count": runs.len(), "runs": shown }));
+        return true;
+    }
+
+    let p = &ctx.printer;
+    p.heading(&format!("Journal ({} run(s))", runs.len()));
+    if runs.is_empty() {
+        p.item(p.dim("nothing has been removed yet"));
+        return true;
+    }
+
+    for run in shown {
+        let size = if run.trashed > 0 {
+            format!("{} to trash", format::size(run.trashed))
+        } else {
+            format!("{} freed", format::size(run.freed))
+        };
+        p.info(format!(
+            "  {}  {:<16} {:<22} {:>16}  {}",
+            run.id,
+            format::datetime(run.epoch),
+            format::truncate(&run.command, 22),
+            size,
+            p.dim(if run.reversible() {
+                "undoable"
+            } else {
+                "permanent"
+            })
+        ));
+    }
+
+    p.info("");
+    p.info(p.dim(&format!("  {}", format::tilde(&journal::dir()))));
+    p.info(p.dim("  detox undo <ID>   puts a run back"));
+    true
+}
+
+fn undo_run(ctx: &Ctx, id: Option<&str>) -> bool {
+    let p = &ctx.printer;
+
+    let Some(run) = journal::find(id) else {
+        p.error(match id {
+            Some(wanted) => format!("no run called `{wanted}` — see detox history"),
+            None => "nothing in the journal to undo".to_string(),
+        });
+        return false;
+    };
+
+    if !run.reversible() {
+        p.error(format!(
+            "{} removed {} for good — there is nothing to put back",
+            run.id,
+            format::size(run.freed)
+        ));
+        return false;
+    }
+
+    if !ctx.json {
+        p.heading(&format!(
+            "{} — {} · {}",
+            run.id,
+            format::datetime(run.epoch),
+            format::since(run.epoch)
+        ));
+        p.field("Command", &run.command);
+        p.field("Entries", format!("{} item(s)", run.moves.len()));
+        p.field("Size", format::size(run.trashed));
+    }
+
+    if !ctx.confirm(&format!("Put back {} item(s)?", run.moves.len())) {
+        if !ctx.json {
+            p.info("Cancelled.");
+        }
+        return false;
+    }
+
+    let result = journal::undo(&run, ctx.dry_run);
+
+    if ctx.json {
+        emit(json!({ "dry_run": ctx.dry_run, "run": run.id, "result": result }));
+        return result.errors.is_empty();
+    }
+
+    p.info("");
+    p.success(format!(
+        "{} item(s) put back, {}{}",
+        result.restored,
+        format::size(result.bytes),
+        if ctx.dry_run { " [dry run]" } else { "" }
+    ));
+    if result.gone > 0 {
+        p.item(p.dim(&format!(
+            "{} no longer in the trash — it was emptied",
+            result.gone
+        )));
+    }
+    if result.occupied > 0 {
+        p.item(p.dim(&format!(
+            "{} left alone: something is at their original path again",
+            result.occupied
+        )));
+    }
+    for error in &result.errors {
+        p.error(error);
+    }
+    result.errors.is_empty()
 }
 
 // ── memory ──────────────────────────────────────────────────────────────────
@@ -749,11 +1427,11 @@ fn memory(ctx: &Ctx, top: usize, all: bool, detail: bool, min: u64) -> bool {
     }
 
     p.info("");
-    p.info(p.dim("  detox-mac inspect <number|name>   detail the processes of one application"));
-    p.info(p.dim("  detox-mac kill <number|name>      stop every process of one application"));
+    p.info(p.dim("  detox inspect <number|name>   detail the processes of one application"));
+    p.info(p.dim("  detox kill <number|name>      stop every process of one application"));
     if shown.iter().any(|group| group.autostart) {
         p.info(p.dim(
-            "  \"starts at login\" = launched by a launchd agent; detox-mac agents disable <label>",
+            "  \"starts at login\" = launched by a launchd agent; detox agents disable <label>",
         ));
     }
 
@@ -769,9 +1447,7 @@ fn target_query(p: &Printer, raw: &str) -> Option<String> {
         Ok(index) => match ram::recall(index) {
             Some(name) => Some(name),
             None => {
-                p.error(format!(
-                    "no group #{index} in memory — run detox-mac ram first"
-                ));
+                p.error(format!("no group #{index} in memory — run detox ram first"));
                 None
             }
         },
@@ -788,7 +1464,7 @@ fn locate<'a>(p: &Printer, snapshot: &'a ram::Snapshot, query: &str) -> Option<&
             for name in names {
                 p.item(name);
             }
-            p.item(p.dim("narrow the name, or use the number shown by detox-mac ram"));
+            p.item(p.dim("narrow the name, or use the number shown by detox ram"));
             None
         }
         ram::Lookup::None => {
@@ -853,7 +1529,7 @@ fn inspect(ctx: &Ctx, raw_query: &str, short: bool) -> bool {
     if !group.agents.is_empty() {
         p.info("");
         p.info(p.dim(&format!(
-            "  detox-mac agents disable {}   stops it from starting on its own",
+            "  detox agents disable {}   stops it from starting on its own",
             group.agents[0]
         )));
     }
@@ -935,7 +1611,7 @@ fn process_arguments(process: &ram::Process) -> Option<String> {
 fn kill(ctx: &Ctx, query: &str, force: bool, allow_system: bool) -> bool {
     let p = &ctx.printer;
 
-    // A number refers to the name shown by the last `detox-mac ram`.
+    // A number refers to the name shown by the last `detox ram`.
     let Some(query) = target_query(p, query) else {
         return false;
     };
@@ -982,9 +1658,7 @@ fn kill(ctx: &Ctx, query: &str, force: bool, allow_system: bool) -> bool {
     }
 
     if suicidal {
-        p.warn(
-            "this group holds the terminal running detox-mac: the command will be cut short too.",
-        );
+        p.warn("this group holds the terminal running detox: the command will be cut short too.");
     }
     if force {
         p.warn("SIGKILL: applications get no chance to save.");
@@ -1120,7 +1794,7 @@ fn act_on_agents(ctx: &Ctx, action: Action, selection: Selection) -> bool {
     let apple_count = selected.iter().filter(|agent| agent.apple).count();
     if apple_count > 0 {
         ctx.printer.warn(format!(
-            "{apple_count} Apple agent(s) skipped: detox-mac never touches system components."
+            "{apple_count} Apple agent(s) skipped: detox never touches system components."
         ));
     }
 

@@ -492,7 +492,7 @@ pub fn remember(groups: &[&Group]) {
     }
 }
 
-/// Name of the group shown at this position by the last `detox-mac ram`.
+/// Name of the group shown at this position by the last `detox ram`.
 pub fn recall(index: usize) -> Option<String> {
     let raw = std::fs::read_to_string(state_path()).ok()?;
     let names: Vec<String> = serde_json::from_str(&raw).ok()?;

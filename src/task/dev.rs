@@ -11,7 +11,10 @@ use std::time::{Duration, SystemTime};
 use serde::Serialize;
 
 use super::Ctx;
-use crate::sys::{cmd, fsx};
+use crate::sys::{
+    cmd,
+    fsx::{self, Move},
+};
 
 /// Detection rule for one ecosystem.
 struct Rule {
@@ -344,11 +347,17 @@ pub enum Method {
 pub struct Removed {
     pub path: PathBuf,
     pub language: &'static str,
+    /// Bytes accounted for, wherever they went.
     pub bytes: u64,
+    /// Bytes moved to the trash rather than removed for good.
+    pub trashed: u64,
     pub method: Method,
     /// Command used, when there was one.
     pub command: Option<String>,
     pub error: Option<String>,
+    /// Trash moves, kept for the journal rather than for display.
+    #[serde(skip)]
+    pub moves: Vec<Move>,
 }
 
 /// Rule matching a language.
@@ -385,10 +394,20 @@ pub fn remove_one(residue: &Residue, toolchain: bool, ctx: &Ctx) -> Removed {
         path: residue.path.clone(),
         language: residue.language,
         bytes: residue.bytes,
+        trashed: 0,
         method: Method::Removed,
         command: None,
         error: None,
+        moves: Vec::new(),
     };
+
+    let policy = ctx.policy();
+
+    if policy.excludes.blocks(&residue.path) {
+        report.bytes = 0;
+        report.error = Some("protected by your exclusions".to_string());
+        return report;
+    }
 
     let command = toolchain.then(|| toolchain_command(residue)).flatten();
 
@@ -418,9 +437,15 @@ pub fn remove_one(residue: &Residue, toolchain: bool, ctx: &Ctx) -> Removed {
     // Whatever is left: the whole directory, or the tool's leftovers.
     let remaining = fsx::size_of(&residue.path);
     if remaining > 0 || residue.path.exists() {
-        if let Err(err) = fsx::remove(&residue.path, false) {
-            report.bytes = residue.bytes.saturating_sub(remaining);
-            report.error = Some(err.to_string());
+        match fsx::remove(&residue.path, &policy) {
+            Ok(removal) => {
+                report.trashed = removal.trashed;
+                report.moves = removal.moves;
+            }
+            Err(err) => {
+                report.bytes = residue.bytes.saturating_sub(remaining);
+                report.error = Some(err);
+            }
         }
     }
 

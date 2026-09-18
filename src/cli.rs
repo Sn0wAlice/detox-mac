@@ -12,7 +12,7 @@ use crate::ui::ColorChoice;
 /// macOS maintenance tool: cleanup, diagnostics and startup agents.
 #[derive(Debug, Parser)]
 #[command(
-    name = "detox-mac",
+    name = "detox",
     version,
     about,
     long_about = None,
@@ -38,6 +38,18 @@ pub struct Options {
     #[arg(short = 'y', long, global = true)]
     pub yes: bool,
 
+    /// Delete for good instead of moving to the trash.
+    #[arg(long, global = true)]
+    pub purge: bool,
+
+    /// Never touch paths matching this glob (repeatable).
+    #[arg(short = 'x', long, global = true, value_name = "GLOB")]
+    pub exclude: Vec<String>,
+
+    /// Ignore the configuration file.
+    #[arg(long, global = true)]
+    pub no_config: bool,
+
     /// Print warnings and errors only.
     #[arg(short, long, global = true, conflicts_with = "json")]
     pub quiet: bool,
@@ -59,6 +71,10 @@ pub enum TargetArg {
     All,
     /// User caches (`~/Library/Caches`).
     Cache,
+    /// Caches of sandboxed applications (`~/Library/Containers`).
+    ContainerCache,
+    /// Global caches of the package managers (npm, cargo, gradle…).
+    PkgCache,
     /// User trash (`~/.Trash`).
     Trash,
     /// User trash plus the trash of every mounted volume.
@@ -75,6 +91,8 @@ pub enum TargetArg {
     Xcode,
     /// iOS simulator devices.
     Simulators,
+    /// Local backups of iPhones and iPads.
+    IosBackups,
 }
 
 impl TargetArg {
@@ -83,6 +101,8 @@ impl TargetArg {
         match self {
             TargetArg::All => None,
             TargetArg::Cache => Some(Target::Cache),
+            TargetArg::ContainerCache => Some(Target::ContainerCache),
+            TargetArg::PkgCache => Some(Target::PkgCache),
             TargetArg::Trash => Some(Target::Trash),
             TargetArg::TrashAll => Some(Target::TrashAll),
             TargetArg::Logs => Some(Target::Logs),
@@ -91,6 +111,7 @@ impl TargetArg {
             TargetArg::Docker => Some(Target::Docker),
             TargetArg::Xcode => Some(Target::Xcode),
             TargetArg::Simulators => Some(Target::Simulators),
+            TargetArg::IosBackups => Some(Target::IosBackups),
         }
     }
 
@@ -169,7 +190,7 @@ pub enum Command {
 
     /// Detail the processes of one application.
     Inspect {
-        /// Application name, or the number shown by `detox-mac ram`.
+        /// Application name, or the number shown by `detox ram`.
         #[arg(value_name = "TARGET", required = true, num_args = 1..)]
         target: Vec<String>,
 
@@ -180,7 +201,7 @@ pub enum Command {
 
     /// Stop every process of one application.
     Kill {
-        /// Application name, or the number shown by `detox-mac ram`.
+        /// Application name, or the number shown by `detox ram`.
         #[arg(value_name = "TARGET", required = true, num_args = 1..)]
         target: Vec<String>,
 
@@ -191,6 +212,35 @@ pub enum Command {
         /// Allow targeting a macOS component or an Apple application.
         #[arg(long)]
         system: bool,
+    },
+
+    /// Find what uninstalled applications left behind.
+    Orphans {
+        /// Remove the leftovers instead of only listing them.
+        #[arg(long)]
+        clean: bool,
+
+        /// Restrict to these bundle identifiers.
+        #[arg(value_name = "BUNDLE_ID")]
+        only: Vec<String>,
+
+        /// Number of applications shown (0 = all).
+        #[arg(short, long, value_name = "N", default_value_t = 20)]
+        top: usize,
+    },
+
+    /// What was removed, and when.
+    History {
+        /// Number of runs shown (0 = all).
+        #[arg(short, long, value_name = "N", default_value_t = 20)]
+        top: usize,
+    },
+
+    /// Put back what a run moved to the trash.
+    Undo {
+        /// Identifier shown by `detox history` (default: the last run).
+        #[arg(value_name = "ID")]
+        id: Option<String>,
     },
 
     /// Manage startup agents and daemons.
@@ -253,6 +303,10 @@ pub enum FileCommand {
         /// `swift package clean`…) instead of removing the directory.
         #[arg(long)]
         native: bool,
+
+        /// Remove everything found without offering to keep any of it.
+        #[arg(long)]
+        all: bool,
     },
 }
 

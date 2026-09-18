@@ -158,10 +158,21 @@ pub fn apply(agent: &Agent, action: Action, ctx: &Ctx) -> Outcome {
     }
 
     if action == Action::Remove {
-        if let Err(err) = fsx::remove(&agent.path, false) {
-            return Outcome::failed(name, format!("{} : {err}", format::tilde(&agent.path)));
+        // A definition file is small and easy to want back: it goes to the
+        // trash unless the user asked for a permanent deletion.
+        let policy = ctx.policy();
+        match fsx::remove(&agent.path, &policy) {
+            Ok(removal) => {
+                let verb = if policy.disposal.is_trash() {
+                    "moved to the trash"
+                } else {
+                    "removed"
+                };
+                let _ = removal;
+                outcome.push(format!("{verb}: {}", format::tilde(&agent.path)));
+            }
+            Err(err) => return Outcome::failed(name, err),
         }
-        outcome.push(format!("removed: {}", format::tilde(&agent.path)));
     }
 
     outcome

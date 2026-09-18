@@ -2,6 +2,7 @@
 
 mod app;
 mod cli;
+mod config;
 mod format;
 mod sys;
 mod task;
@@ -13,7 +14,7 @@ use clap::Parser;
 
 fn main() -> ExitCode {
     if cfg!(not(target_os = "macos")) {
-        eprintln!("detox-mac only runs on macOS.");
+        eprintln!("detox only runs on macOS.");
         return ExitCode::FAILURE;
     }
 

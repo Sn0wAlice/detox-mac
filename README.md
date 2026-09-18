@@ -6,11 +6,13 @@
 > Like *CleanMyMac*, but open-source, scriptable, and no BS.
 
 ```bash
-detox-mac info          # what the machine holds, and what can be reclaimed
-detox-mac ram           # what is eating memory, grouped by application
-detox-mac files dev     # build residue sleeping in your projects
-detox-mac clean all -n  # what would be deleted, touching nothing
-detox-mac clean all     # go
+detox info          # what the machine holds, and what can be reclaimed
+detox ram           # what is eating memory, grouped by application
+detox files dev     # build residue sleeping in your projects
+detox orphans       # what uninstalled applications left behind
+detox clean all -n  # what would be deleted, touching nothing
+detox clean all     # go, into the trash
+detox undo          # actually, no
 ```
 
 ---
@@ -29,24 +31,36 @@ detox-mac clean all     # go
 | `ram` | Processes grouped by parent application, sorted by memory |
 | `inspect <target>` | Process tree of one application, with CPU, age and arguments |
 | `kill <target>` | Stop every process of one application (by name or number) |
+| `orphans` | Leftovers of applications that are no longer installed |
+| `history` | What was removed, when, and whether it can come back |
+| `undo [ID]` | Put back what a run moved to the trash |
 | `agents list\|disable\|enable\|remove` | Startup agents and daemons (`launchd`) |
 | `sys dns\|spotlight\|memory\|snapshots\|updates` | One-off system operations |
 | `completions <shell>` | bash / zsh / fish / elvish / powershell completions |
 
 ### Cleaning targets
 
-| Target | Contents |
-|---|---|
-| `cache` | `~/Library/Caches` |
-| `trash` | `~/.Trash` |
-| `trash-all` | `~/.Trash` plus the `.Trashes` of every mounted volume |
-| `logs` | `~/Library/Logs` |
-| `ds-store` | `.DS_Store` files in the home directory |
-| `homebrew` | Homebrew download cache (`brew cleanup --prune=all -s`) |
-| `docker` | Unused containers, images and build caches — **never volumes** |
-| `xcode` | DerivedData, DeviceSupport (iOS/watchOS/tvOS), simulator caches |
-| `simulators` | iOS simulator devices — **left out of `all`**, ask for it explicitly |
-| `all` | Every target above except `simulators` |
+| Target | Contents | Losing it costs |
+|---|---|---|
+| `cache` | `~/Library/Caches` | nothing |
+| `container-cache` | `Data/Library/Caches` of every sandboxed app | nothing |
+| `logs` | `~/Library/Logs` | nothing |
+| `ds-store` | `.DS_Store` files in the home directory | nothing |
+| `homebrew` | Homebrew download cache (`brew cleanup --prune=all -s`) | nothing |
+| `pkg-cache` | Global caches of npm, yarn, pnpm, bun, cargo, go, gradle, maven, pip, uv, SwiftPM, CocoaPods, composer, NuGet, pub | a download |
+| `docker` | Unused containers, images and build caches — **never volumes** | a download |
+| `xcode` | DerivedData, Archives, DeviceSupport (iOS/watchOS/tvOS), simulator caches | a build |
+| `trash` | `~/.Trash` | your data |
+| `trash-all` | `~/.Trash` plus your own trash on every mounted volume | your data |
+| `simulators` | iOS simulator devices — **left out of `all`** | a download |
+| `ios-backups` | Local iPhone and iPad backups — **left out of `all`** | your data |
+| `all` | Every target above except `simulators` and `ios-backups` |  |
+
+The last column is not decoration: `scan` sorts by it, so the free wins come
+first, and it decides how many times `clean` asks before acting.
+
+`container-cache` and `ios-backups` are invisible without Full Disk Access.
+Rather than report them as empty, the tool says it cannot read them.
 
 Docker is only cleaned when it is installed **and** the daemon answers;
 otherwise the target is skipped with the reason. Same for Homebrew and Xcode.
@@ -65,10 +79,13 @@ Or, without `cargo install`:
 
 ```bash
 cargo build --release
-sudo cp target/release/detox-mac /usr/local/bin/
+sudo cp target/release/detox /usr/local/bin/
 ```
 
 Requires macOS and Rust 1.85+ (2024 edition).
+
+> The crate is `detox-mac`; the command you type is **`detox`**. Its files live
+> under `~/.config/detox-mac` and `~/.local/state/detox-mac`.
 
 ---
 
@@ -80,6 +97,9 @@ Requires macOS and Rust 1.85+ (2024 edition).
 |---|---|
 | `-n`, `--dry-run` | Measure and print what would happen, change nothing |
 | `-y`, `--yes` | Answer yes to every confirmation (scripts, cron) |
+| `--purge` | Delete for good instead of moving to the trash |
+| `-x`, `--exclude <GLOB>` | Never touch paths matching this glob (repeatable) |
+| `--no-config` | Ignore the configuration file |
 | `-q`, `--quiet` | Print warnings and errors only |
 | `--json` | JSON on stdout, for scripts |
 | `--color <auto\|always\|never>` | Colour (also honours `NO_COLOR`) |
@@ -88,39 +108,77 @@ Requires macOS and Rust 1.85+ (2024 edition).
 
 ```bash
 # Quick diagnosis
-detox-mac info
+detox info
 
 # Full measurement, slow targets included (.DS_Store, Docker…)
-detox-mac scan all
+detox scan all
 
 # Clean only the harmless things, no confirmation
-detox-mac clean cache logs trash --yes
+detox clean cache logs trash --yes
+
+# The package manager caches, usually the biggest free win
+detox scan pkg-cache
+detox clean pkg-cache
+
+# Protect something for the length of one command
+detox clean all -x '~/Documents/archives/**'
+
+# Leftovers of applications that are gone
+detox orphans
+detox orphans --clean
+
+# What did I remove yesterday, and can I have it back?
+detox history
+detox undo
 
 # See what a full cleanup would free
-detox-mac clean all --dry-run
+detox clean all --dry-run
 
 # The 30 largest applications
-detox-mac apps --top 30
+detox apps --top 30
 
 # Files over 2 GB in a specific directory
-detox-mac files large --min 2G --path ~/Movies
+detox files large --min 2G --path ~/Movies
 
 # Build residue untouched for more than a week
-detox-mac files dev
-detox-mac files clean --older-than 30
+detox files dev
+detox files clean --older-than 30
 
 # What is holding memory, then stop it
-detox-mac ram --detail --top 5
-detox-mac inspect discord
-detox-mac kill discord
+detox ram --detail --top 5
+detox inspect discord
+detox kill discord
 
 # Third-party startup agents, then disable one
-detox-mac agents list --third-party
-detox-mac agents disable com.docker.helper
+detox agents list --third-party
+detox agents disable com.docker.helper
 
 # Purgeable space and updates
-detox-mac sys snapshots
-detox-mac sys updates
+detox sys snapshots
+detox sys updates
+```
+
+### What the numbers mean
+
+Sizes are the **blocks the files occupy**, not their apparent length — the same
+thing `du` reports, and the same thing you get back. That matters more than it
+sounds:
+
+- a sparse file is counted for what it takes, not for the hole it declares;
+- a transparently compressed file is counted compressed;
+- a file reachable through several **hard links** is counted once, which is the
+  difference between a plausible number and a wild one on a pnpm or npm store.
+
+APFS **clones** are the one case that cannot be detected: two files sharing
+their blocks after a copy-on-write copy each report their full size, and no
+per-file API says otherwise. That is a known overstatement, not a silent one.
+
+A directory that cannot be read is **never counted as empty**. It is reported,
+and the totals say how many were missed:
+
+```
+  Sandboxed app caches         — unreadable — grant Full Disk Access to your terminal
+! 470 directories could not be read — grant Full Disk Access to your terminal
 ```
 
 ### Progress
@@ -139,33 +197,39 @@ terminal. `--color always` forces it back on.
 ### Shell completions
 
 ```bash
-detox-mac completions zsh > ~/.zsh/completions/_detox-mac
+detox completions zsh > ~/.zsh/completions/_detox
 ```
 
 ### JSON output
 
+Every document carries a `schema` number, bumped when a field changes meaning.
+
 ```bash
-detox-mac scan all --json | jq '.total'
-detox-mac files dev --json | jq '[.residue[].bytes] | add'
-detox-mac ram --json | jq '.groups[] | select(.autostart) | .name'
-detox-mac inspect spotify --json | jq '.group.processes[].args'
-detox-mac agents list --json | jq '.agents[] | select(.apple == false) | .label'
+detox scan all --json | jq '.total'
+detox scan all --json | jq '.targets[] | select(.risk == "cache")'
+detox clean cache --json --yes | jq '{freed, trashed, disposal}'
+detox orphans --json | jq '.leftovers[0]'
+detox history --json | jq '.runs[] | select(.disposal == "trash") | .id'
+detox files dev --json | jq '[.residue[].bytes] | add'
+detox ram --json | jq '.groups[] | select(.autostart) | .name'
+detox inspect spotify --json | jq '.group.processes[].args'
+detox agents list --json | jq '.agents[] | select(.apple == false) | .label'
 ```
 
 ---
 
 ## 🧹 Build residue
 
-`detox-mac files dev` looks for directories the toolchain knows how to rebuild
+`detox files dev` looks for directories the toolchain knows how to rebuild
 — `target`, `node_modules`, `.gradle`, `vendor`… — and only reports those that
 have not moved for a while.
 
 ```bash
-detox-mac files dev                          # untouched for 7 days
-detox-mac files dev --older-than 30          # only the really dormant ones
-detox-mac files dev --lang rust node         # one ecosystem in particular
-detox-mac files clean --older-than 30        # remove them, after confirmation
-detox-mac files clean --path ~/dev -n        # dry run on a specific directory
+detox files dev                          # untouched for 7 days
+detox files dev --older-than 30          # only the really dormant ones
+detox files dev --lang rust node         # one ecosystem in particular
+detox files clean --older-than 30        # remove them, after confirmation
+detox files clean --path ~/dev -n        # dry run on a specific directory
 ```
 
 ```
@@ -216,7 +280,7 @@ puts it back.
 `--native` hands over to the language's tool where one exists:
 
 ```bash
-detox-mac files clean --native --older-than 30
+detox files clean --native --older-than 30
 ```
 
 - The tool is only used when it is **installed** (`gradlew` is looked up in the
@@ -233,15 +297,15 @@ detox-mac files clean --native --older-than 30
 
 ## 🧠 Memory
 
-`detox-mac ram` does what Activity Monitor does, more readably: it groups
+`detox ram` does what Activity Monitor does, more readably: it groups
 processes **by parent application**, so an Electron app with fifteen helpers is
 a single line.
 
 ```bash
-detox-mac ram                      # top 15 applications outside macOS
-detox-mac ram --detail             # with the processes of each group
-detox-mac ram --all                # include macOS and Apple applications
-detox-mac ram --min 100M --top 0   # everything above 100 MB
+detox ram                      # top 15 applications outside macOS
+detox ram --detail             # with the processes of each group
+detox ram --all                # include macOS and Apple applications
+detox ram --min 100M --top 0   # everything above 100 MB
 ```
 
 ```
@@ -263,17 +327,17 @@ Processes outside macOS (21 group(s) — 7.36 GB)
   everything would end up under `launchd`.
 - **`starts at login`** marks an application launched by a `launchd` agent:
   that is where updaters and background daemons hide. Stop one with
-  `detox-mac agents disable <label>`.
+  `detox agents disable <label>`.
 - The figure shown is the real footprint (`top`), the one Activity Monitor
   reports; `ps` is the fallback when it is unavailable.
 
 ### Understanding one application
 
 ```bash
-detox-mac inspect 2            # the 2nd group of the last detox-mac ram
-detox-mac inspect spotify      # by name
-detox-mac inspect claude       # `claude` (CLI) and `Claude` (app) stay distinct
-detox-mac inspect spotify -s   # without command lines
+detox inspect 2            # the 2nd group of the last detox ram
+detox inspect spotify      # by name
+detox inspect claude       # `claude` (CLI) and `Claude` (app) stay distinct
+detox inspect spotify -s   # without command lines
 ```
 
 ```
@@ -302,11 +366,11 @@ instant sample: that is what exposes a background process grinding away.
 The numbers in the left column are shortcuts for `kill`:
 
 ```bash
-detox-mac kill 3               # the 3rd group of the last detox-mac ram
-detox-mac kill discord         # by name
-detox-mac kill vs code         # `vs code` finds `Visual Studio Code`
-detox-mac kill spotify --force # SIGKILL, when SIGTERM was not enough
-detox-mac kill -n discord      # dry run: lists the targeted processes
+detox kill 3               # the 3rd group of the last detox ram
+detox kill discord         # by name
+detox kill vs code         # `vs code` finds `Visual Studio Code`
+detox kill spotify --force # SIGKILL, when SIGTERM was not enough
+detox kill -n discord      # dry run: lists the targeted processes
 ```
 
 `kill` sends `SIGTERM` to **every** process of the group, roots first so that
@@ -324,33 +388,149 @@ helpers shut down cleanly, then checks who survived.
 
 ## 🛡️ Safety
 
-`detox-mac` deletes files. It is built so that never happens by surprise.
+`detox-mac` deletes files. It is built so that never happens by surprise, and
+so that a mistake is not the end of the story.
 
-- **Confirmation** before any destructive operation (unless `--yes` or
-  `--dry-run`). Outside a terminal, it refuses to act without `--yes`.
+### Deletion goes to the trash
+
+By default nothing is destroyed: entries are **moved to `~/.Trash`**, which
+makes every cleanup reversible. The output says so, because "freed" would be a
+lie — the blocks are still allocated until the trash is emptied:
+
+```
+  Moved to trash:  4.20 GB
+  Still on disk until the trash is emptied — detox clean trash
+  Changed your mind? detox undo
+```
+
+`--purge` deletes for good instead. The trash targets themselves always purge:
+emptying the trash into the trash is not a thing.
+
+Files on another volume cannot be moved to the user's trash; rather than
+silently deleting them, the tool says so and points at `--purge`.
+
+### Asking twice
+
+A confirmation before any destructive operation, as before — and a **second,
+typed confirmation** whenever the run cannot be undone:
+
+```
+? Clean: cache? [y/N] y
+! This cannot be undone — nothing goes to the trash: cache.
+? Type delete forever to confirm, anything else to cancel:
+```
+
+A stray `y` cannot get through that one. The second gate is asked when
+`--purge` is in effect, when a target always purges, and when a target holds
+your own data rather than cache. It is skipped by `--yes` — which prints a
+warning line instead — and can be turned off in the configuration.
+
+### The journal
+
+Every run that removes something writes a file under
+`~/.local/state/detox-mac/journal`:
+
+```bash
+detox history          # what was removed, when, and whether it can come back
+detox undo             # put the last run back
+detox undo 20260918-230512
+```
+
+`undo` never overwrites: an original path that is occupied again is left alone
+and reported, as is anything no longer in the trash.
+
+### And still
+
 - **Dry run** (`-n`): exact measurement of what would go, zero modification.
 - **Apple agents are never disabled nor removed**, even with `--all-third-party`.
 - **Docker volumes are never pruned**: they hold your data.
-- **iOS simulators are excluded from `all`**: several GB to download again.
+- **iOS simulators and iOS backups are excluded from `all`**.
+- **`trash-all` only touches your own trash** on each volume, never the other
+  accounts' on that machine.
 - Symlinks are never followed, when walking or when deleting.
 
-### Sudo
+### Exclusions
 
-`sys dns`, `sys spotlight`, `sys memory`, and the agents under `/Library`,
-need root. Without it the operation is **skipped** with a clear message — never
-half attempted:
+Nothing matching an exclusion is removed, listed or counted — it never reaches
+the confirmation in the first place:
 
 ```bash
-sudo detox-mac sys dns
+detox clean all -x '~/Documents/archives/**' -x '**/.venv'
+detox files clean -x '~/dev/current-project/**'
 ```
 
-### Exit codes
+Command-line exclusions add to the configured ones; one never replaces the
+other, so `-x` can only ever protect more.
 
-| Code | Meaning |
-|---|---|
-| `0` | Success (a skipped operation is still a success) |
-| `1` | Something failed, or a confirmation was declined |
-| `2` | Usage error (invalid arguments) |
+---
+
+## ⚙️ Configuration
+
+`~/.config/detox-mac/config.toml` (or `$DETOX_MAC_CONFIG`), all optional:
+
+```toml
+# Paths that must never be touched, whatever the command.
+# `*` stays inside a path segment, `**` crosses directories, a bare name
+# matches any single component.
+exclude = [
+  "~/Documents/archives/**",
+  "**/.venv",
+  ".env",
+]
+
+# What a deletion does: "trash" (default) or "purge".
+disposal = "trash"
+
+# Targets used by `clean` and `scan` when none is given.
+default_targets = ["cache", "logs", "pkg-cache"]
+
+# Ask a second time before anything irreversible. Default: true.
+confirm_twice = true
+```
+
+A line the parser cannot make sense of is **reported and ignored**, never
+guessed at — a misspelled `disposal` leaves the safe default in place rather
+than silently doing something else. `--no-config` skips the file entirely.
+
+---
+
+## 🧟 Leftovers
+
+Dragging an application to the trash takes the bundle and leaves everything
+else behind.
+
+```bash
+detox orphans                  # list them
+detox orphans --clean          # remove them, after two confirmations
+detox orphans --clean com.acme.app
+```
+
+```
+Leftovers of uninstalled applications (35 — 2.2 MB)
+    1.     1.3 MB  com.xamarin.fontconfig               cache
+    2.     404 KB  com.nootch.Nootch                    container
+    3.     252 KB  dev.grimoire.poc                     support
+```
+
+Matching is deliberately conservative, because guessing here means eating
+someone's data:
+
+- A directory is only attributed when its **name is a bundle identifier**
+  (`com.acme.app`, two dots at least). A hand-named directory —
+  `Application Support/Sublime Text` — is never claimed, so the list is
+  **shorter than what is really there**, by design.
+- An identifier related to an installed one counts as installed: helpers,
+  frameworks and extensions belong to their application.
+- Installed means more than `/Applications`: preference panes count, and so do
+  the applications that live inside `Application Support` — updaters, embedded
+  CLIs — which is what keeps Chrome's updater off the list.
+- Group containers are matched under their real identifier, team prefix and
+  `group.` marker removed.
+- Apple identifiers are never listed.
+
+Places searched: `Application Support`, `Containers`, `Group Containers`,
+`Caches`, `Logs`, `HTTPStorages`, `WebKit`, `Preferences`,
+`Saved Application State`, `Cookies`, `LaunchAgents`.
 
 ---
 
@@ -361,16 +541,19 @@ src/
 ├── main.rs            # Entry point, exit code
 ├── cli.rs             # Command-line definition (clap)
 ├── app.rs             # Command dispatch and rendering (text / JSON)
-├── format.rs          # Human-readable sizes, durations, paths
+├── config.rs          # Exclusions, disposal mode, defaults
+├── format.rs          # Human-readable sizes, durations, dates, paths
 ├── ui.rs              # Colours, progress bars, confirmations
 ├── sys/               # System access
 │   ├── cmd.rs         #   Running external commands
-│   ├── fsx.rs         #   Walking, measuring and removing files
+│   ├── fsx.rs         #   Measuring, walking, trashing and removing files
 │   └── machine.rs     #   Machine info (sw_vers, sysctl, vm_stat, df)
 └── task/              # Business logic, independent of display
     ├── clean.rs       #   Cleaning targets: measure and remove
     ├── dev.rs         #   Build residue, per ecosystem
     ├── docker.rs      #   Docker detection and prunes
+    ├── orphans.rs     #   Leftovers of uninstalled applications
+    ├── journal.rs     #   What was removed, and how to put it back
     ├── agents.rs      #   launchd startup agents
     ├── maintenance.rs #   DNS, Spotlight, memory, snapshots, updates
     ├── ram.rs         #   Memory snapshot, grouping, inspection, shutdown

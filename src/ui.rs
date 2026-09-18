@@ -154,6 +154,37 @@ impl Printer {
 
         matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
     }
+
+    /// Asks the user to type a word exactly. A stray `y` cannot get through
+    /// this one, which is the whole point of asking twice.
+    pub fn confirm_typed(&self, phrase: &str) -> bool {
+        let Some(answer) = self.ask(&format!(
+            "Type {} to confirm, anything else to cancel:",
+            self.bold(phrase)
+        )) else {
+            return false;
+        };
+        answer.trim() == phrase
+    }
+
+    /// Reads one line from the user. `None` outside a terminal.
+    pub fn ask(&self, prompt: &str) -> Option<String> {
+        if !io::stdin().is_terminal() {
+            self.error(format!(
+                "{prompt} — not an interactive terminal, pass --yes to confirm."
+            ));
+            return None;
+        }
+
+        print!("{} {} ", self.paint(YELLOW, "?"), prompt);
+        let _ = io::stdout().flush();
+
+        let mut answer = String::new();
+        match io::stdin().read_line(&mut answer) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(answer.trim().to_string()),
+        }
+    }
 }
 
 /// Minimal progress indicator drawn on a single line of stderr.
@@ -264,5 +295,68 @@ impl Progress {
 impl Drop for Progress {
     fn drop(&mut self) {
         self.finish();
+    }
+}
+
+/// Parses a list of numbers and ranges: `1,4-6,9`.
+///
+/// Returns zero-based positions, rejecting anything out of range rather than
+/// quietly ignoring it — a typo in a list of things to keep must not end with
+/// them being removed.
+pub fn parse_ranges(input: &str, count: usize) -> Result<Vec<usize>, String> {
+    let mut chosen = Vec::new();
+
+    for piece in input
+        .split([',', ' '])
+        .filter(|part| !part.trim().is_empty())
+    {
+        let piece = piece.trim();
+        let (start, end) = match piece.split_once('-') {
+            Some((start, end)) => (start.trim(), end.trim()),
+            None => (piece, piece),
+        };
+
+        let start: usize = start
+            .parse()
+            .map_err(|_| format!("`{piece}` is not a number or a range"))?;
+        let end: usize = end
+            .parse()
+            .map_err(|_| format!("`{piece}` is not a number or a range"))?;
+
+        if start == 0 || end == 0 || start > count || end > count {
+            return Err(format!("`{piece}` is outside 1–{count}"));
+        }
+        if start > end {
+            return Err(format!("`{piece}` runs backwards"));
+        }
+
+        for number in start..=end {
+            if !chosen.contains(&(number - 1)) {
+                chosen.push(number - 1);
+            }
+        }
+    }
+
+    Ok(chosen)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_numbers_and_ranges() {
+        assert_eq!(parse_ranges("1,4-6", 10).unwrap(), vec![0, 3, 4, 5]);
+        assert_eq!(parse_ranges("2 3", 10).unwrap(), vec![1, 2]);
+        assert_eq!(parse_ranges("", 10).unwrap(), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn refuses_what_it_cannot_honour() {
+        // Silently dropping a bad entry would delete what the user meant to keep.
+        assert!(parse_ranges("11", 10).is_err());
+        assert!(parse_ranges("0", 10).is_err());
+        assert!(parse_ranges("6-2", 10).is_err());
+        assert!(parse_ranges("all", 10).is_err());
     }
 }

@@ -4,16 +4,20 @@ pub mod agents;
 pub mod clean;
 pub mod dev;
 pub mod docker;
+pub mod journal;
 pub mod maintenance;
+pub mod orphans;
 pub mod ram;
 pub mod scan;
 
 use serde::Serialize;
 
+use crate::config::Config;
+use crate::sys::fsx::{Disposal, Policy};
 use crate::ui::Printer;
 
 /// Context shared by every task.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Ctx {
     /// Measure only, change nothing.
     pub dry_run: bool,
@@ -21,10 +25,28 @@ pub struct Ctx {
     pub yes: bool,
     /// Machine-readable output: no interactive prompt is possible.
     pub json: bool,
+    /// Remove for good instead of moving to the trash.
+    pub purge: bool,
+    /// Exclusions, defaults and safety settings.
+    pub config: Config,
     pub printer: Printer,
 }
 
 impl Ctx {
+    /// What a deletion does in this run.
+    pub fn disposal(&self) -> Disposal {
+        if self.purge {
+            Disposal::Purge
+        } else {
+            self.config.disposal
+        }
+    }
+
+    /// The removal policy this run must obey.
+    pub fn policy(&self) -> Policy<'_> {
+        Policy::new(self.dry_run, self.disposal(), &self.config.exclude)
+    }
+
     /// Asks for confirmation, unless simulating or `--yes` was passed.
     pub fn confirm(&self, question: &str) -> bool {
         if self.dry_run || self.yes {
@@ -36,6 +58,34 @@ impl Ctx {
             return false;
         }
         self.printer.confirm(question)
+    }
+
+    /// Second gate, for what cannot be undone.
+    ///
+    /// A `y` given in a hurry is cheap; typing the word is not. This is only
+    /// asked when the run really is irreversible — a deletion that goes to the
+    /// trash stops at the first confirmation.
+    pub fn confirm_final(&self, warning: &str, phrase: &str) -> bool {
+        if self.dry_run {
+            return true;
+        }
+        if !self.config.confirm_twice {
+            return true;
+        }
+
+        if self.yes {
+            // Scripted, but the user still deserves to see it in the log.
+            self.printer.warn(format!("{warning} — allowed by --yes."));
+            return true;
+        }
+        if self.json {
+            self.printer
+                .error("confirmation required: add --yes when using --json.");
+            return false;
+        }
+
+        self.printer.warn(warning);
+        self.printer.confirm_typed(phrase)
     }
 }
 
