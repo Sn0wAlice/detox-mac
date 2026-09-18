@@ -1,239 +1,141 @@
-use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style, Stylize},
-    text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap},
-    Frame,
-};
+//! Sortie terminal : couleurs, mise en forme, confirmations.
 
-use crate::app::{App, TaskStatus};
+use std::io::{self, IsTerminal, Write};
 
-pub fn draw(f: &mut Frame, app: &App) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3),  // header + tabs
-            Constraint::Min(8),    // task list
-            Constraint::Length(10), // log
-            Constraint::Length(2), // help bar
-        ])
-        .split(f.area());
-
-    draw_header(f, app, chunks[0]);
-    draw_tasks(f, app, chunks[1]);
-    draw_log(f, app, chunks[2]);
-    draw_help(f, app, chunks[3]);
+/// Politique de coloration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum ColorChoice {
+    /// Couleurs si la sortie est un terminal.
+    Auto,
+    /// Toujours colorer.
+    Always,
+    /// Jamais de couleurs.
+    Never,
 }
 
-fn draw_header(f: &mut Frame, app: &App, area: Rect) {
-    let tab_titles: Vec<Line> = app.tabs.iter().map(|t| Line::from(t.name)).collect();
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+const DIM: &str = "\x1b[2m";
+const RED: &str = "\x1b[31m";
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+const BLUE: &str = "\x1b[34m";
+const CYAN: &str = "\x1b[36m";
 
-    let title = if app.dry_run {
-        " detox-mac [SIMULATION] "
-    } else {
-        " detox-mac "
-    };
-
-    let title_style = if app.dry_run {
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD)
-    };
-
-    let tabs = Tabs::new(tab_titles)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(title)
-                .title_style(title_style),
-        )
-        .select(app.active_tab)
-        .style(Style::default().fg(Color::DarkGray))
-        .highlight_style(
-            Style::default()
-                .fg(Color::White)
-                .bg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-        .divider(Span::raw(" | "));
-
-    f.render_widget(tabs, area);
+/// Écrit sur la sortie standard en respectant les options globales.
+#[derive(Debug, Clone, Copy)]
+pub struct Printer {
+    color: bool,
+    quiet: bool,
 }
 
-fn draw_tasks(f: &mut Frame, app: &App, area: Rect) {
-    let tab = &app.tabs[app.active_tab];
-
-    let items: Vec<ListItem> = tab
-        .tasks
-        .iter()
-        .enumerate()
-        .map(|(i, task)| {
-            let checkbox = if task.checked { "[x]" } else { "[ ]" };
-
-            let status_icon = match task.status {
-                TaskStatus::Pending => " ",
-                TaskStatus::Done => " ",
-                TaskStatus::Error => " ",
-            };
-
-            let is_selected = i == tab.selected;
-
-            let style = match task.status {
-                TaskStatus::Done => Style::default().fg(Color::Green),
-                TaskStatus::Error => Style::default().fg(Color::Red),
-                TaskStatus::Pending if is_selected => Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-                TaskStatus::Pending => Style::default().fg(Color::White),
-            };
-
-            let pointer = if is_selected { "▸ " } else { "  " };
-            let root_badge = if task.needs_root { " [sudo]" } else { "" };
-
-            // Badge confirmation
-            let confirm_badge = if app.confirming && is_selected {
-                " ⚠ Confirmer? (Entrée/Esc)"
-            } else {
-                ""
-            };
-
-            let line = Line::from(vec![
-                Span::styled(pointer, style),
-                Span::styled(format!("{} ", checkbox), Style::default().fg(Color::DarkGray)),
-                Span::styled(status_icon, style),
-                Span::styled(task.name, style),
-                Span::styled(
-                    root_badge,
-                    Style::default()
-                        .fg(Color::Red)
-                        .add_modifier(Modifier::DIM),
-                ),
-                Span::styled(
-                    confirm_badge,
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]);
-
-            ListItem::new(vec![
-                line,
-                Line::from(vec![
-                    Span::raw("      "),
-                    Span::styled(task.description, Style::default().fg(Color::DarkGray)),
-                ]),
-            ])
-        })
-        .collect();
-
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(format!(" {} ", tab.name.trim()))
-            .title_style(Style::default().fg(Color::Cyan)),
-    );
-
-    f.render_widget(list, area);
-}
-
-fn draw_log(f: &mut Frame, app: &App, area: Rect) {
-    let inner_height = area.height.saturating_sub(2) as usize;
-    let total = app.log.len();
-
-    let start = if total <= inner_height {
-        0
-    } else {
-        app.log_scroll.min(total.saturating_sub(inner_height))
-    };
-
-    let visible_lines: Vec<Line> = app.log[start..]
-        .iter()
-        .take(inner_height)
-        .map(|msg| {
-            let color = if msg.contains("Erreur") || msg.contains("Nécessite sudo") {
-                Color::Red
-            } else if msg.contains("SIMULATION") {
-                Color::Yellow
-            } else if msg.contains("OK")
-                || msg.contains("libéré")
-                || msg.contains("vidée")
-                || msg.contains("purgée")
-                || msg.contains("réinitialisé")
-                || msg.contains("Terminé")
-                || msg.contains("supprimé")
-                || msg.contains("désactivé")
-                || msg.contains("réactivé")
-            {
-                Color::Green
-            } else if msg.starts_with("───") || msg.starts_with("═══") || msg.starts_with("──") {
-                Color::Cyan
-            } else if msg.contains("Confirmer") || msg.contains("Annulé") {
-                Color::Yellow
-            } else {
-                Color::Gray
-            };
-            Line::from(Span::styled(msg.as_str(), Style::default().fg(color)))
-        })
-        .collect();
-
-    let log_title = if app.dry_run {
-        " Journal [SIMULATION] "
-    } else {
-        " Journal "
-    };
-
-    let log_block = Paragraph::new(visible_lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(log_title)
-                .title_style(Style::default().fg(Color::Yellow)),
-        )
-        .wrap(Wrap { trim: false });
-
-    f.render_widget(log_block, area);
-}
-
-fn draw_help(f: &mut Frame, app: &App, area: Rect) {
-    let mut spans = vec![
-        Span::styled(" ↑↓ ", Style::default().fg(Color::Yellow).bold()),
-        Span::styled("Nav  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Espace ", Style::default().fg(Color::Yellow).bold()),
-        Span::styled("Sél  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("Entrée ", Style::default().fg(Color::Yellow).bold()),
-        Span::styled("Exec  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("r ", Style::default().fg(Color::Yellow).bold()),
-        Span::styled("Tous  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("◄► ", Style::default().fg(Color::Yellow).bold()),
-        Span::styled("Onglet  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("d ", Style::default().fg(Color::Yellow).bold()),
-    ];
-
-    if app.dry_run {
-        spans.push(Span::styled(
-            "Simulation ON  ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    } else {
-        spans.push(Span::styled("Simulation  ", Style::default().fg(Color::DarkGray)));
+impl Printer {
+    pub fn new(choice: ColorChoice, quiet: bool) -> Self {
+        let color = match choice {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => {
+                std::env::var_os("NO_COLOR").is_none() && io::stdout().is_terminal()
+            }
+        };
+        Self { color, quiet }
     }
 
-    spans.extend([
-        Span::styled("PgUp/Dn ", Style::default().fg(Color::Yellow).bold()),
-        Span::styled("Scroll  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("q ", Style::default().fg(Color::Yellow).bold()),
-        Span::styled("Quitter", Style::default().fg(Color::DarkGray)),
-    ]);
+    fn paint(&self, code: &str, text: &str) -> String {
+        if self.color {
+            format!("{code}{text}{RESET}")
+        } else {
+            text.to_string()
+        }
+    }
 
-    let help_text = Line::from(spans);
-    let help = Paragraph::new(help_text).block(Block::default().borders(Borders::TOP));
+    pub fn bold(&self, text: &str) -> String {
+        self.paint(BOLD, text)
+    }
 
-    f.render_widget(help, area);
+    pub fn dim(&self, text: &str) -> String {
+        self.paint(DIM, text)
+    }
+
+    pub fn accent(&self, text: &str) -> String {
+        self.paint(CYAN, text)
+    }
+
+    fn line(&self, text: impl AsRef<str>) {
+        if !self.quiet {
+            println!("{}", text.as_ref());
+        }
+    }
+
+    /// Titre de section.
+    pub fn heading(&self, text: &str) {
+        self.line("");
+        self.line(self.paint(BOLD, text));
+    }
+
+    /// Ligne d'information simple.
+    pub fn info(&self, text: impl AsRef<str>) {
+        self.line(text);
+    }
+
+    /// Paire clé / valeur alignée.
+    pub fn field(&self, key: &str, value: impl AsRef<str>) {
+        self.line(format!("  {:<16} {}", self.dim(key), value.as_ref()));
+    }
+
+    /// Ligne de liste.
+    pub fn item(&self, text: impl AsRef<str>) {
+        self.line(format!("  {}", text.as_ref()));
+    }
+
+    /// Succès.
+    pub fn success(&self, text: impl AsRef<str>) {
+        self.line(format!("{} {}", self.paint(GREEN, "✓"), text.as_ref()));
+    }
+
+    /// Opération ignorée.
+    pub fn skipped(&self, text: impl AsRef<str>) {
+        self.line(format!("{} {}", self.paint(BLUE, "–"), text.as_ref()));
+    }
+
+    /// Avertissement : toujours affiché, sur stderr.
+    pub fn warn(&self, text: impl AsRef<str>) {
+        eprintln!("{} {}", self.paint(YELLOW, "!"), text.as_ref());
+    }
+
+    /// Erreur : toujours affichée, sur stderr.
+    pub fn error(&self, text: impl AsRef<str>) {
+        eprintln!("{} {}", self.paint(RED, "✗"), text.as_ref());
+    }
+
+    /// Bandeau du mode simulation.
+    pub fn dry_run_banner(&self) {
+        self.line(self.paint(
+            YELLOW,
+            "◆ Mode simulation — aucune modification ne sera faite.",
+        ));
+    }
+
+    /// Demande une confirmation interactive. Renvoie `false` hors terminal.
+    pub fn confirm(&self, question: &str) -> bool {
+        if !io::stdin().is_terminal() {
+            self.error(format!(
+                "{question} — entrée non interactive, utilisez --yes pour confirmer."
+            ));
+            return false;
+        }
+
+        print!("{} {} [o/N] ", self.paint(YELLOW, "?"), question);
+        let _ = io::stdout().flush();
+
+        let mut answer = String::new();
+        if io::stdin().read_line(&mut answer).is_err() {
+            return false;
+        }
+
+        matches!(
+            answer.trim().to_ascii_lowercase().as_str(),
+            "o" | "oui" | "y" | "yes"
+        )
+    }
 }

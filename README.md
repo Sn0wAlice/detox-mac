@@ -2,114 +2,155 @@
 
 ![](./.github/banner.png)
 
-> A fast, cute and clean Rust-based macOS maintenance TUI tool.
-> Think of it as *CleanMyMac*, but open-source, modular, and no BS. 🦀
+> Outil de maintenance macOS en ligne de commande, écrit en Rust. 🦀
+> Comme *CleanMyMac*, mais open-source, scriptable, et sans bullshit.
+
+```bash
+detox-mac info          # ce que contient la machine, et ce qui est récupérable
+detox-mac clean all -n  # ce qui serait supprimé, sans rien toucher
+detox-mac clean all     # on y va
+```
 
 ---
 
-## ✨ Features
+## ✨ Ce que ça fait
 
-### 🧹 Nettoyage
-- Nettoyer les caches utilisateur (`~/Library/Caches`)
-- Vider la corbeille (`~/.Trash`) ou toutes les corbeilles (volumes montés inclus)
-- Nettoyer les logs (`~/Library/Logs`)
-- Supprimer les fichiers `.DS_Store` récursivement
-- Nettoyer le cache Homebrew (`brew cleanup --prune=all`)
-- Nettoyer les données Xcode (DerivedData, DeviceSupport, Simulateurs)
+| Commande | Rôle |
+|---|---|
+| `info` | Résumé machine (macOS, CPU, RAM, disque, uptime) + espace récupérable + agents de démarrage |
+| `scan [CIBLE…]` | Mesure l'espace récupérable, **sans jamais rien supprimer** |
+| `clean <CIBLE…>` | Nettoie une ou plusieurs cibles (`all` pour tout) |
+| `apps` | Applications installées, de la plus lourde à la plus légère |
+| `files` | Fichiers volumineux du dossier personnel |
+| `agents list\|disable\|enable\|remove` | Agents et démons de démarrage (`launchd`) |
+| `sys dns\|spotlight\|memory\|snapshots\|updates` | Opérations système ponctuelles |
+| `completions <shell>` | Complétion bash / zsh / fish / elvish / powershell |
 
-### 💻 Système
-- Afficher les infos système (CPU, RAM, disque, version macOS, uptime)
-- Vérifier les mises à jour macOS (`softwareupdate -l`)
-- Lister les apps les plus volumineuses (`/Applications`)
-- Détecter les gros fichiers (> 500 Mo dans `~`)
-- Flush DNS (`dscacheutil` + `mDNSResponder`)
-- Libérer l'espace disque (snapshots Time Machine)
-- Réindexer Spotlight (`mdutil -E`)
-- Purger la RAM inactive (`purge`)
+### Cibles de nettoyage
 
-### 🚀 Démarrage
-- Vue détaillée des LaunchAgents/Daemons (label, statut actif/inactif, tag Apple/Tiers)
-- Lister uniquement les agents tiers (non-Apple)
-- Désactiver/réactiver les agents tiers sans les supprimer (`launchctl unload/load`)
-- Supprimer les LaunchAgents utilisateur (avec `launchctl unload` avant suppression)
-- Supprimer tous les LaunchAgents/Daemons
+| Cible | Contenu |
+|---|---|
+| `cache` | `~/Library/Caches` |
+| `trash` | `~/.Trash` |
+| `trash-all` | `~/.Trash` + `.Trashes` de chaque volume monté |
+| `logs` | `~/Library/Logs` |
+| `ds-store` | Fichiers `.DS_Store` du dossier personnel |
+| `homebrew` | Cache de téléchargement Homebrew (`brew cleanup --prune=all -s`) |
+| `docker` | Conteneurs, images et caches de build inutilisés — **jamais les volumes** |
+| `xcode` | DerivedData, DeviceSupport (iOS/watchOS/tvOS), caches du simulateur |
+| `simulators` | Appareils du simulateur iOS — **exclu de `all`**, à demander explicitement |
+| `all` | Toutes les cibles ci-dessus sauf `simulators` |
 
-### 🛡️ Sécurité & UX
-- **Mode Simulation (dry-run)** : voir ce qui serait fait sans rien modifier
-- **Confirmation** avant chaque tâche destructive
-- **Dashboard au démarrage** : résumé système + espace récupérable (caches, corbeille, logs) + nombre d'agents
-- Affichage de la taille avant/après chaque opération de nettoyage
+Docker n'est nettoyé que s'il est installé **et** que le démon répond ; sinon la
+cible est simplement ignorée. Idem pour Homebrew et Xcode.
 
 ---
 
 ## 🚀 Installation
 
 ```bash
-git clone https://github.com/youruser/detox-mac.git
+git clone https://github.com/Sn0wAlice/detox-mac.git
 cd detox-mac
-cargo build --release
-cp target/release/detox-mac /usr/local/bin/detox-mac
+cargo install --path .
 ```
+
+Ou, sans `cargo install` :
+
+```bash
+cargo build --release
+sudo cp target/release/detox-mac /usr/local/bin/
+```
+
+Prérequis : macOS et Rust 1.85+ (édition 2024).
 
 ---
 
 ## 🔧 Utilisation
 
-Lancez simplement :
+### Options globales
+
+| Option | Effet |
+|---|---|
+| `-n`, `--dry-run` | Mesure et affiche ce qui serait fait, sans rien modifier |
+| `-y`, `--yes` | Répond oui à toutes les confirmations (scripts, cron) |
+| `-q`, `--quiet` | N'affiche que les avertissements et les erreurs |
+| `--json` | Sortie JSON sur stdout, pour les scripts |
+| `--color <auto\|always\|never>` | Coloration (respecte aussi `NO_COLOR`) |
+
+### Exemples
 
 ```bash
-detox-mac
+# Diagnostic rapide
+detox-mac info
+
+# Mesure complète, y compris les cibles lentes (.DS_Store, Docker…)
+detox-mac scan all
+
+# Nettoyer seulement ce qui est sans risque, sans confirmation
+detox-mac clean cache logs trash --yes
+
+# Voir ce qu'un nettoyage complet libérerait
+detox-mac clean all --dry-run
+
+# Les 30 plus grosses applications
+detox-mac apps --top 30
+
+# Les fichiers de plus de 2 Go dans un dossier précis
+detox-mac files --min 2G --path ~/Movies
+
+# Agents de démarrage tiers, puis désactivation de l'un d'eux
+detox-mac agents list --third-party
+detox-mac agents disable com.docker.helper
+
+# Espace purgeable et mises à jour
+detox-mac sys snapshots
+detox-mac sys updates
 ```
 
-L'application s'ouvre en mode TUI interactif avec 4 onglets.
+### Complétion shell
 
-### Raccourcis clavier
+```bash
+detox-mac completions zsh > ~/.zsh/completions/_detox-mac
+```
 
-| Touche | Action |
-|---|---|
-| `↑` `↓` / `j` `k` | Naviguer dans les tâches |
-| `←` `→` / `Tab` | Changer d'onglet |
-| `Entrée` | Exécuter la tâche sélectionnée |
-| `Espace` | Cocher/décocher pour exécution groupée |
-| `r` | Lancer toutes les tâches cochées |
-| `d` | Activer/désactiver le mode simulation |
-| `PgUp` / `PgDn` | Scroller le journal |
-| `Esc` | Annuler la confirmation / Quitter |
-| `q` | Quitter |
+### Sortie JSON
 
-### Onglets
-
-| Onglet | Description |
-|---|---|
-| **Général** | Tâches d'optimisation rapide (caches, corbeille, logs, DNS...) |
-| **Nettoyage** | Nettoyage détaillé (Homebrew, Xcode, toutes corbeilles...) |
-| **Système** | Infos, mises à jour, scan d'apps/fichiers, DNS, Spotlight, RAM |
-| **Démarrage** | Gestion des LaunchAgents/Daemons (vue, filtre, disable/enable) |
+```bash
+detox-mac scan all --json | jq '.total'
+detox-mac agents list --json | jq '.agents[] | select(.apple == false) | .label'
+```
 
 ---
 
-## 🛡️ Sudo
+## 🛡️ Sécurité
 
-Certaines opérations nécessitent des privilèges élevés (flush DNS, Spotlight, purge RAM).
-Lancez avec sudo si besoin :
+`detox-mac` supprime des fichiers : l'outil est construit pour que ça n'arrive jamais par surprise.
+
+- **Confirmation** avant toute opération destructive (sauf `--yes` ou `--dry-run`).
+  Hors terminal (script, pipe), l'outil refuse d'agir sans `--yes`.
+- **Mode simulation** (`-n`) : mesure exacte de ce qui serait supprimé, zéro modification.
+- **Les agents Apple ne sont jamais désactivés ni supprimés**, même avec `--all-third-party`.
+- **Les volumes Docker ne sont jamais purgés** : ils contiennent vos données.
+- **Les simulateurs iOS sont exclus de `all`** : plusieurs Go à retélécharger.
+- Les liens symboliques ne sont jamais suivis lors des parcours ni des suppressions.
+
+### Sudo
+
+`sys dns`, `sys spotlight`, `sys memory`, ainsi que les agents de `/Library`,
+nécessitent les privilèges root. Sans eux, l'opération est **ignorée** avec un
+message clair — jamais tentée à moitié :
 
 ```bash
-sudo detox-mac
+sudo detox-mac sys dns
 ```
 
-Les tâches nécessitant sudo sont marquées `[sudo]` dans l'interface.
+### Codes de sortie
 
----
-
-## 🧪 Mode Simulation
-
-Appuyez sur `d` pour activer le mode simulation. Dans ce mode :
-- Aucun fichier n'est supprimé
-- Aucune commande système n'est exécutée
-- Les tailles et fichiers concernés sont affichés normalement
-- Le header et le journal indiquent `[SIMULATION]`
-
-Idéal pour voir ce que l'app ferait avant de lancer pour de vrai.
+| Code | Signification |
+|---|---|
+| `0` | Succès (une opération ignorée reste un succès) |
+| `1` | Au moins une opération a échoué, ou confirmation refusée |
+| `2` | Erreur d'usage (arguments invalides) |
 
 ---
 
@@ -117,28 +158,58 @@ Idéal pour voir ce que l'app ferait avant de lancer pour de vrai.
 
 ```
 src/
-├── main.rs              # Point d'entrée, boucle d'événements
-├── app.rs               # État de l'app, onglets, tâches, logique
-├── ui.rs                # Rendu TUI (ratatui)
-└── modules/
-    ├── cache.rs          # Nettoyage des caches utilisateur
-    ├── trash.rs          # Vidage corbeille (simple + multi-volumes)
-    ├── logs.rs           # Nettoyage des logs
-    ├── dsstore.rs        # Suppression des .DS_Store
-    ├── homebrew.rs       # Nettoyage cache Homebrew
-    ├── xcode.rs          # Nettoyage données Xcode
-    ├── system.rs         # Commandes système (DNS, Spotlight, RAM...)
-    ├── sysinfo.rs        # Infos système & dashboard
-    ├── scanner.rs        # Scan apps volumineuses & gros fichiers
-    ├── launch.rs         # Suppression LaunchAgents/Daemons
-    ├── login.rs          # Vue détaillée, filtre Apple/tiers, disable/enable
-    └── utils.rs          # Utilitaires (tailles, dry-run, wrappers)
+├── main.rs            # Point d'entrée, code de sortie
+├── cli.rs             # Définition de la ligne de commande (clap)
+├── app.rs             # Dispatch des commandes et mise en forme (texte / JSON)
+├── format.rs          # Tailles lisibles, chemins abrégés
+├── ui.rs              # Couleurs, confirmations, sortie terminal
+├── sys/               # Accès système
+│   ├── cmd.rs         #   Exécution de commandes externes
+│   ├── fsx.rs         #   Parcours, mesure et suppression de fichiers
+│   └── machine.rs     #   Infos machine (sw_vers, sysctl, vm_stat, df)
+└── task/              # Logique métier, indépendante de l'affichage
+    ├── clean.rs       #   Cibles de nettoyage : mesure et suppression
+    ├── docker.rs      #   Détection Docker et purges
+    ├── agents.rs      #   Agents de démarrage launchd
+    ├── maintenance.rs #   DNS, Spotlight, mémoire, instantanés, mises à jour
+    └── scan.rs        #   Applications et gros fichiers
 ```
 
-**Dépendances** : `ratatui`, `crossterm` — rien d'autre.
+Les tâches renvoient des structures sérialisables ; `app.rs` décide seul de
+l'affichage. C'est ce qui permet d'avoir `--json` sans dupliquer une ligne de logique.
+
+**Dépendances** : `clap`, `clap_complete`, `serde`, `serde_json`.
+
+```bash
+cargo test          # tests unitaires
+cargo clippy        # lint
+cargo fmt           # format
+```
 
 ---
 
-## ❤️ Why?
+## 🔄 Migration depuis la 0.1 (TUI)
 
-Because we love our Macs, but we don't love bloated cleanup apps.
+La 0.2 remplace l'interface TUI par de vraies sous-commandes : scriptable,
+composable, testable.
+
+| Avant (TUI) | Maintenant |
+|---|---|
+| Onglet *Général* / *Nettoyage* | `detox-mac clean <cible>` |
+| Touche `d` (simulation) | `--dry-run` |
+| Touche `Espace` + `r` (exécution groupée) | `detox-mac clean cache logs trash` |
+| Onglet *Système* | `detox-mac sys <opération>` |
+| Onglet *Démarrage* | `detox-mac agents <sous-commande>` |
+| Dashboard de démarrage | `detox-mac info` |
+
+`ratatui` et `crossterm` ne sont plus des dépendances.
+
+---
+
+## ❤️ Pourquoi ?
+
+Parce qu'on aime nos Macs, mais pas les applis de nettoyage bouffies.
+
+## 📄 Licence
+
+GPL-3.0-or-later — voir [LICENSE](./LICENSE).

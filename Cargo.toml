@@ -1,8 +1,25 @@
 [package]
 name = "detox-mac"
-version = "0.1.0"
-edition = "2021"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Outil de maintenance macOS en ligne de commande : nettoyage, diagnostic et gestion des agents de démarrage."
+authors = ["Sn0wAlice"]
+license = "GPL-3.0-or-later"
+repository = "https://github.com/Sn0wAlice/detox-mac"
+readme = "README.md"
+keywords = ["macos", "cleaner", "maintenance", "cli"]
+categories = ["command-line-utilities"]
 
 [dependencies]
-ratatui = "0.28"
-crossterm = "0.28"
+clap = { version = "4.6", features = ["derive"] }
+clap_complete = "4.6"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
