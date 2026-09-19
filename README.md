@@ -52,16 +52,20 @@ detox undo          # actually, no
 | `homebrew` | Homebrew download cache (`brew cleanup --prune=all -s`) | nothing |
 | `pkg-cache` | Global caches of npm, yarn, pnpm, bun, cargo, go, gradle, maven, pip, uv, SwiftPM, CocoaPods, composer, NuGet, pub | a download |
 | `docker` | Unused containers, images and build caches — **never volumes** | a download |
-| `xcode` | DerivedData, Archives, DeviceSupport (iOS/watchOS/tvOS), simulator caches | a build |
+| `xcode` | DerivedData, DeviceSupport (iOS/watchOS/tvOS), simulator caches | a build |
+| `xcode-archives` | Release archives and the dSYMs of builds you shipped — **left out of `all`** | your data |
 | `trash` | `~/.Trash` | your data |
 | `trash-all` | `~/.Trash` plus your own trash on every mounted volume | your data |
 | `simulators` | iOS simulator devices — **left out of `all`** | a download |
 | `ios-backups` | Local iPhone and iPad backups — **left out of `all`** | your data |
 | `vm` | Colima, Lima, Podman, VirtualBox, Vagrant, Parallels images — **left out of `all`** | your data |
-| `all` | Every target above except `simulators` and `ios-backups` |  |
+| `all` | Every target above except `xcode-archives`, `simulators`, `ios-backups` and `vm` |  |
 
 The last column is not decoration: `scan` sorts by it, so the free wins come
-first, and it decides how many times `clean` asks before acting.
+first, and it decides how many times `clean` asks before acting. `xcode` and
+`xcode-archives` are split for that reason alone — DerivedData is a build
+away, while the dSYMs in an archive are the only ones that will ever
+symbolicate the version already in someone's hands.
 
 `container-cache` and `ios-backups` are invisible without Full Disk Access.
 Rather than report them as empty, the tool says it cannot read them.

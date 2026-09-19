@@ -304,6 +304,27 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_age_never_satisfies_a_dormancy_filter() {
+        // The shape of the filter `apps --unused N` applies. What broke it
+        // was an entry that could not be dated being kept rather than
+        // dropped — with `is_none_or`, every such application matched every
+        // threshold, including ones opened that morning.
+        let dated = |days: Option<u64>| Entry {
+            name: "Demo".to_string(),
+            path: PathBuf::from("/Applications/Demo.app"),
+            bytes: 0,
+            unused_days: days,
+            evidence: None,
+        };
+
+        let mut apps = vec![dated(Some(400)), dated(Some(3)), dated(None)];
+        apps.retain(|app| app.unused_days.is_some_and(|used| used >= 180));
+
+        assert_eq!(apps.len(), 1);
+        assert_eq!(apps[0].unused_days, Some(400));
+    }
+
+    #[test]
     fn the_strongest_signal_wins_and_the_rest_go_unread() {
         // Spotlight answered, so neither fallback should even be reached.
         assert_eq!(

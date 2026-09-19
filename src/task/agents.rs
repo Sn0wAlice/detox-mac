@@ -104,8 +104,12 @@ fn label_of(path: &Path) -> String {
 }
 
 /// An Apple-provided agent must never be disabled nor removed.
+///
+/// Shares the check with `orphans`: Apple does not confine itself to
+/// `com.apple.`, and an agent wrongly read as third-party is one this tool
+/// would offer to switch off.
 fn is_apple(label: &str) -> bool {
-    label.starts_with("com.apple.")
+    super::orphans::is_apple(label)
 }
 
 /// Action that can be applied to an agent.

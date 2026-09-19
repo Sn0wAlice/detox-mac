@@ -61,8 +61,10 @@ pub enum Target {
     Homebrew,
     /// Docker: unused containers, images and build caches (never volumes).
     Docker,
-    /// Xcode data: DerivedData, DeviceSupport, archives, simulator caches.
+    /// Xcode build data: DerivedData, DeviceSupport, simulator caches.
     Xcode,
+    /// Xcode release archives (your data, asked for explicitly).
+    XcodeArchives,
     /// iOS simulator devices (heavy, must be asked for explicitly).
     Simulators,
     /// Local backups of iPhones and iPads (your data, asked for explicitly).
@@ -90,7 +92,7 @@ impl Target {
     ];
 
     /// Every target that can be named on the command line.
-    pub const EVERY: [Target; 13] = [
+    pub const EVERY: [Target; 14] = [
         Target::Cache,
         Target::ContainerCache,
         Target::PkgCache,
@@ -101,6 +103,7 @@ impl Target {
         Target::Homebrew,
         Target::Docker,
         Target::Xcode,
+        Target::XcodeArchives,
         Target::Simulators,
         Target::IosBackups,
         Target::Vm,
@@ -126,7 +129,8 @@ impl Target {
             Target::DsStore => ".DS_Store files",
             Target::Homebrew => "Homebrew cache",
             Target::Docker => "Docker (images, builds)",
-            Target::Xcode => "Xcode data",
+            Target::Xcode => "Xcode build data",
+            Target::XcodeArchives => "Xcode archives",
             Target::Simulators => "iOS simulators",
             Target::IosBackups => "iOS device backups",
             Target::Vm => "Virtual machines",
@@ -146,6 +150,7 @@ impl Target {
             Target::Homebrew => "homebrew",
             Target::Docker => "docker",
             Target::Xcode => "xcode",
+            Target::XcodeArchives => "xcode-archives",
             Target::Simulators => "simulators",
             Target::IosBackups => "ios-backups",
             Target::Vm => "vm",
@@ -176,7 +181,14 @@ impl Target {
             Target::PkgCache | Target::Docker | Target::Xcode | Target::Simulators => {
                 Risk::Rebuildable
             }
-            Target::Trash | Target::TrashAll | Target::IosBackups | Target::Vm => Risk::Data,
+            // An archive is the only copy of the dSYMs for a build that
+            // shipped. Rebuilding produces different ones, so a crash report
+            // from the version already out there stops symbolicating.
+            Target::Trash
+            | Target::TrashAll
+            | Target::XcodeArchives
+            | Target::IosBackups
+            | Target::Vm => Risk::Data,
         }
     }
 
@@ -203,9 +215,11 @@ impl Target {
             Target::DsStore => Strategy::DsStore,
             Target::Homebrew => Strategy::Homebrew,
             Target::Docker => Strategy::Docker,
+            Target::XcodeArchives => {
+                Strategy::Dirs(vec![fsx::home_join("Library/Developer/Xcode/Archives")])
+            }
             Target::Xcode => Strategy::Dirs(vec![
                 fsx::home_join("Library/Developer/Xcode/DerivedData"),
-                fsx::home_join("Library/Developer/Xcode/Archives"),
                 fsx::home_join("Library/Developer/Xcode/iOS DeviceSupport"),
                 fsx::home_join("Library/Developer/Xcode/watchOS DeviceSupport"),
                 fsx::home_join("Library/Developer/Xcode/tvOS DeviceSupport"),
@@ -759,6 +773,31 @@ mod tests {
         assert!(!Target::DEFAULT.contains(&Target::Simulators));
         assert!(!Target::DEFAULT.contains(&Target::IosBackups));
         assert!(!Target::DEFAULT.contains(&Target::Vm));
+        assert!(!Target::DEFAULT.contains(&Target::XcodeArchives));
+    }
+
+    #[test]
+    fn release_archives_are_not_filed_with_the_build_cache() {
+        // They used to ride along inside `xcode`, which `all` sweeps and
+        // which calls itself rebuildable. DerivedData is; the dSYMs of a
+        // build that already shipped are not — rebuilding makes different
+        // ones, and the crash reports from the shipped version stop
+        // symbolicating. So they need naming, like every other target that
+        // holds something the disk is the only copy of.
+        assert_eq!(Target::XcodeArchives.risk(), Risk::Data);
+        assert_eq!(Target::Xcode.risk(), Risk::Rebuildable);
+
+        let archives = fsx::home_join("Library/Developer/Xcode/Archives");
+        assert!(dirs_of(Target::XcodeArchives).contains(&archives));
+        assert!(!dirs_of(Target::Xcode).contains(&archives));
+    }
+
+    /// The directories a `Dirs` target would act on.
+    fn dirs_of(target: Target) -> Vec<PathBuf> {
+        match target.strategy() {
+            Strategy::Dirs(dirs) => dirs,
+            _ => Vec::new(),
+        }
     }
 
     #[test]

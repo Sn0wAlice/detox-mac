@@ -313,9 +313,13 @@ impl Rule {
 /// Time since the directory — or its top-level content — was last modified: a
 /// `target` that was just compiled into is never considered old.
 fn age(path: &Path) -> Duration {
-    let mut latest = std::fs::symlink_metadata(path)
-        .and_then(|meta| meta.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH);
+    // Falling back to the epoch here made anything unreadable look fifty
+    // years idle, which clears every `--older-than` there is. A directory
+    // that cannot be dated is not thereby stale: report it as untouched now
+    // and let it fail the threshold instead of sailing through it.
+    let Ok(mut latest) = std::fs::symlink_metadata(path).and_then(|meta| meta.modified()) else {
+        return Duration::ZERO;
+    };
 
     if let Ok(entries) = std::fs::read_dir(path) {
         for entry in entries.flatten() {
@@ -480,6 +484,31 @@ mod tests {
                 rule.language
             );
         }
+    }
+
+    #[test]
+    fn a_directory_that_cannot_be_dated_is_not_reported_as_stale() {
+        // A path with no readable modification time used to fall back to the
+        // epoch, which reads as fifty years idle and clears every
+        // `--older-than` threshold. Unknown has to fail the filter, not pass
+        // it: this is the one direction that deletes something.
+        assert_eq!(
+            age(Path::new("/detox-mac/definitely/not/here")),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn a_directory_is_as_recent_as_its_newest_child() {
+        let dir = std::env::temp_dir().join("detox-mac-test-residue-age");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("build")).unwrap();
+        std::fs::write(dir.join("build/artifact.o"), b"x").unwrap();
+
+        // Just written, so nothing here is stale at any threshold above zero.
+        assert!(age(&dir.join("build")).as_secs() < 60);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

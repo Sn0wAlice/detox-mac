@@ -88,8 +88,10 @@ pub enum TargetArg {
     Homebrew,
     /// Docker: unused containers, images and build caches.
     Docker,
-    /// Xcode data: DerivedData, DeviceSupport, simulator caches.
+    /// Xcode build data: DerivedData, DeviceSupport, simulator caches.
     Xcode,
+    /// Xcode release archives, with the dSYMs of builds you shipped.
+    XcodeArchives,
     /// iOS simulator devices.
     Simulators,
     /// Local backups of iPhones and iPads.
@@ -113,6 +115,7 @@ impl TargetArg {
             TargetArg::Homebrew => Some(Target::Homebrew),
             TargetArg::Docker => Some(Target::Docker),
             TargetArg::Xcode => Some(Target::Xcode),
+            TargetArg::XcodeArchives => Some(Target::XcodeArchives),
             TargetArg::Simulators => Some(Target::Simulators),
             TargetArg::IosBackups => Some(Target::IosBackups),
             TargetArg::Vm => Some(Target::Vm),

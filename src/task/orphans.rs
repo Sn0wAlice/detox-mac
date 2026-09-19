@@ -20,10 +20,40 @@ use crate::format;
 use crate::sys::{
     cmd,
     fsx::{self, Move, Policy},
+    par,
 };
 
 /// Bundle kinds that carry an identifier and count as "installed".
 const BUNDLE_EXTENSIONS: [&str; 2] = ["app", "prefPane"];
+
+/// Where an application keeps the extensions and helpers it ships with.
+///
+/// These carry identifiers of their own, and not ones derived from their
+/// parent: `ImageOptim.app` holds `net.pornel.ImageOptimizeExtension`, which
+/// is neither `net.pornel.ImageOptim` nor a child of it in the `{id}.` sense.
+/// Skip them and their containers read as leftovers of installed software.
+const NESTED_BUNDLE_DIRS: [&str; 6] = [
+    "Contents/PlugIns",
+    "Contents/Extensions",
+    "Contents/XPCServices",
+    "Contents/Applications",
+    "Contents/Library/LoginItems",
+    "Contents/Library/QuickLook",
+];
+
+/// Identifier namespaces belonging to macOS itself.
+///
+/// `com.apple.` is the obvious one. Shortcuts still uses the `is.workflow.`
+/// namespace it carried before Apple bought it, and nothing in the name says
+/// so — its two group containers looked like a third party's leftovers.
+const APPLE_NAMESPACES: [&str; 2] = ["com.apple.", "is.workflow."];
+
+/// Whether an identifier belongs to macOS, and so is never a leftover.
+pub fn is_apple(id: &str) -> bool {
+    APPLE_NAMESPACES
+        .iter()
+        .any(|namespace| id.starts_with(namespace) || id == namespace.trim_end_matches('.'))
+}
 
 /// Where a bundle can legitimately live, and how deep to look.
 ///
@@ -74,17 +104,49 @@ pub fn installed(progress: &mut impl FnMut(&str)) -> Vec<String> {
         collect_bundles(root, *depth, &mut bundles);
     }
 
-    let mut ids = Vec::new();
-    for bundle in bundles {
+    // Progress is reported over the applications, which is what a reader
+    // recognises; their extensions are counted with them.
+    let mut all = bundles.clone();
+    for bundle in &bundles {
         progress(&bundle.file_stem().unwrap_or_default().to_string_lossy());
-        if let Some(id) = bundle_id(&bundle) {
-            ids.push(id);
-        }
+        all.extend(nested_bundles(bundle));
     }
+
+    // One `plutil` per bundle, and the nested ones triple the count — enough
+    // to be worth spreading over the cores.
+    let mut ids: Vec<String> = par::map(&all, |bundle| bundle_id(bundle), |_, _| {})
+        .into_iter()
+        .flatten()
+        .collect();
 
     ids.sort();
     ids.dedup();
     ids
+}
+
+/// The bundles an application carries inside itself.
+///
+/// Only the handful of directories Apple reserves for them, one level deep:
+/// a full walk of every application is minutes of work, and an extension
+/// buried deeper than this does not exist.
+fn nested_bundles(bundle: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+
+    for dir in NESTED_BUNDLE_DIRS {
+        let Ok(entries) = std::fs::read_dir(bundle.join(dir)) else {
+            continue;
+        };
+        // Anything with an `Info.plist` may carry an identifier; anything
+        // without one cannot, and is not worth a process to find out.
+        found.extend(
+            entries
+                .flatten()
+                .map(|entry| entry.path())
+                .filter(|path| path.join("Contents/Info.plist").is_file()),
+        );
+    }
+
+    found
 }
 
 fn collect_bundles(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
@@ -201,7 +263,16 @@ fn canonical_id(name: &str) -> &str {
         _ => name,
     };
 
-    name.strip_prefix("group.").unwrap_or(name)
+    // macOS spells a shared container three ways, and only one of them was
+    // being unwrapped — which left `systemgroup.com.apple.…` and
+    // `groups.com.apple.…` looking like identifiers no installed app owns.
+    for prefix in ["systemgroup.", "groups.", "group."] {
+        if let Some(rest) = name.strip_prefix(prefix) {
+            return rest;
+        }
+    }
+
+    name
 }
 
 /// Whether an identifier belongs to something still installed.
@@ -209,7 +280,7 @@ fn canonical_id(name: &str) -> &str {
 /// A helper (`com.acme.app.helper`) counts as installed when its application
 /// is, and so does the other way round.
 fn is_installed(id: &str, installed: &[String]) -> bool {
-    if id.starts_with("com.apple.") || id == "com.apple" {
+    if is_apple(id) {
         return true;
     }
     installed.iter().any(|known| {
@@ -431,5 +502,105 @@ mod tests {
         // The bundle is `com.acme.app.framework`, the app `com.acme.app`.
         let installed = vec!["com.acme.app.framework".to_string()];
         assert!(is_installed("com.acme.app", &installed));
+    }
+
+    #[test]
+    fn every_spelling_of_a_shared_container_is_unwrapped() {
+        // All three wrap an identifier that belongs to installed software.
+        // Only `group.` was being stripped, so the other two reached the
+        // report as identifiers nothing owned — one of them Find My's.
+        assert_eq!(canonical_id("group.com.acme.app"), "com.acme.app");
+        assert_eq!(
+            canonical_id("groups.com.apple.podcasts"),
+            "com.apple.podcasts"
+        );
+        assert_eq!(
+            canonical_id("systemgroup.com.apple.icloud.searchpartyd.sharedsettings"),
+            "com.apple.icloud.searchpartyd.sharedsettings"
+        );
+        // A team identifier in front of any of them comes off first.
+        assert_eq!(
+            canonical_id("243LU875E5.groups.com.apple.podcasts"),
+            "com.apple.podcasts"
+        );
+    }
+
+    #[test]
+    fn apple_group_containers_are_never_orphans() {
+        // What this pins, end to end: these four were reported as removable
+        // leftovers on a machine where Shortcuts, Podcasts and Find My were
+        // all installed and working.
+        for name in [
+            "systemgroup.com.apple.icloud.searchpartyd.sharedsettings",
+            "243LU875E5.groups.com.apple.podcasts",
+            "group.is.workflow.my.app",
+            "group.is.workflow.shortcuts",
+        ] {
+            assert!(
+                is_installed(canonical_id(name), &[]),
+                "{name} belongs to macOS and must never be offered for deletion"
+            );
+        }
+    }
+
+    #[test]
+    fn shortcuts_keeps_the_namespace_it_was_bought_with() {
+        // `is.workflow.*` is Apple — Shortcuts.app declares exactly these as
+        // its app groups — and no part of the name says so.
+        assert!(is_apple("is.workflow.my.app"));
+        assert!(is_apple("is.workflow.shortcuts"));
+        assert!(is_apple("com.apple.Safari"));
+        // The namespace, not a lookalike vendor sitting next to it.
+        assert!(!is_apple("is.workflowy.app"));
+        assert!(!is_apple("com.appleseed.tool"));
+        assert!(!is_apple("net.pornel.ImageOptim"));
+    }
+
+    #[test]
+    fn a_name_that_is_only_a_prefix_is_not_a_child() {
+        // The gap that hid ImageOptim's extension: the identifier starts
+        // with the application's, but the next character is not a dot, so no
+        // relation rule covers it. It has to come from the bundle itself.
+        let installed = vec!["net.pornel.ImageOptim".to_string()];
+        assert!(!is_installed(
+            "net.pornel.ImageOptimizeExtension",
+            &installed
+        ));
+
+        // Which it does, once the extension inside the bundle is read.
+        let installed = vec![
+            "net.pornel.ImageOptim".to_string(),
+            "net.pornel.ImageOptimizeExtension".to_string(),
+        ];
+        assert!(is_installed(
+            "net.pornel.ImageOptimizeExtension",
+            &installed
+        ));
+    }
+
+    #[test]
+    fn extensions_inside_an_application_are_found() {
+        let root = std::env::temp_dir().join("detox-mac-test-nested-bundles");
+        let _ = std::fs::remove_dir_all(&root);
+        let app = root.join("Demo.app");
+
+        // An extension, exactly where macOS puts one.
+        let appex = app.join("Contents/PlugIns/Share.appex/Contents");
+        std::fs::create_dir_all(&appex).unwrap();
+        std::fs::write(appex.join("Info.plist"), b"stub").unwrap();
+
+        // A resource directory in the same place that carries no identifier,
+        // and so is not worth a process to interrogate.
+        std::fs::create_dir_all(app.join("Contents/PlugIns/Assets.bundle")).unwrap();
+
+        let found = nested_bundles(&app);
+        assert_eq!(found.len(), 1, "found {found:?}");
+        assert!(found[0].ends_with("Share.appex"));
+
+        // Nothing nested, nothing claimed — and no panic on an application
+        // that has no PlugIns directory at all.
+        assert!(nested_bundles(&root.join("Bare.app")).is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

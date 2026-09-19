@@ -631,6 +631,31 @@ mod tests {
     }
 
     #[test]
+    fn a_process_that_cannot_be_placed_counts_as_the_systems() {
+        // `ps` gives a bare `comm` for a kernel thread, and a path it cannot
+        // resolve for anything else odd. Nothing about that says the process
+        // is disposable, and this flag is what keeps `ram` from offering to
+        // kill it — so the unplaceable case has to land on the safe side.
+        assert!(is_system("kernel_task"));
+        assert!(is_system(""));
+        assert!(is_system("(idle)"));
+    }
+
+    #[test]
+    fn a_lookalike_prefix_is_not_a_system_path() {
+        // The guard is a path prefix, so these must not be swept in with
+        // `/usr/` and `/bin/` — they are ordinary user software.
+        assert!(!is_system("/usrlocal/bin/tool"));
+        assert!(!is_system("/Users/alice/bin/tool"));
+        assert!(!is_system("/Library/Application Support/Acme/helper"));
+        // …while Apple's own corner of /Library stays protected.
+        assert!(is_system("/Library/Apple/System/Library/helper"));
+        assert!(is_system(
+            "/Library/PrivilegedHelperTools/com.apple.installer"
+        ));
+    }
+
+    #[test]
     fn splits_paths_containing_spaces() {
         let line = "  79148 78801 654688 alice  /Applications/Claude.app/Contents/MacOS/Claude Helper (Renderer)";
         let (fields, path) = split_fields(line, 4).unwrap();

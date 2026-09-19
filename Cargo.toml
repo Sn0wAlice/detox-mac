@@ -1,6 +1,6 @@
 [package]
 name = "detox-mac"
-version = "0.2.0"
+version = "1.0.1"
 edition = "2024"
 rust-version = "1.85"
 description = "macOS maintenance from the command line: cleanup, diagnostics and startup agents."

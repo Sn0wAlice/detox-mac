@@ -252,9 +252,15 @@ fn matches_parts(pattern: &[&str], path: &[&str]) -> bool {
 }
 
 /// Wildcard match inside a single path component.
+///
+/// Case-insensitive, because the disk this runs on is: macOS formats APFS
+/// without case sensitivity by default, so `Downloads` and `downloads` name
+/// the same directory and `-x '*.dmg'` has to cover `Installer.DMG`. Erring
+/// wide is the harmless direction here — every use of this is an exclusion,
+/// and a pattern that matches too much protects a file too many.
 fn matches_segment(pattern: &str, text: &str) -> bool {
-    let pattern: Vec<char> = pattern.chars().collect();
-    let text: Vec<char> = text.chars().collect();
+    let pattern: Vec<char> = pattern.to_lowercase().chars().collect();
+    let text: Vec<char> = text.to_lowercase().chars().collect();
 
     let (mut p, mut t) = (0usize, 0usize);
     let (mut star, mut resume) = (None, 0usize);
@@ -314,6 +320,39 @@ mod tests {
         let excludes = Excludes::new(vec!["/keep/**".to_string()]);
         assert!(excludes.blocks(Path::new("/keep/a/b/c.txt")));
         assert!(!excludes.blocks(Path::new("/other/a")));
+    }
+
+    #[test]
+    fn an_exclusion_ignores_case_like_the_disk_does() {
+        // APFS is formatted without case sensitivity by default, so these
+        // name one file. A pattern that missed on case was a protection the
+        // user wrote, was shown back in `--dry-run`, and did not get.
+        assert!(matches_segment("*.dmg", "Installer.DMG"));
+        assert!(matches_segment("*.DMG", "installer.dmg"));
+
+        let excludes = Excludes::new(vec!["~/Downloads/keep/**".to_string()]);
+        assert!(excludes.blocks(Path::new("~/downloads/KEEP/invoice.pdf")));
+        // Wide, not blind: a different directory is still not protected.
+        assert!(!excludes.blocks(Path::new("~/Downloads/other/invoice.pdf")));
+    }
+
+    #[test]
+    fn a_protected_directory_covers_what_is_under_it() {
+        // Named without a wildcard, an ancestor still protects its contents:
+        // the point of `-x ~/Projects` is not to have to write the glob.
+        let excludes = Excludes::new(vec!["/keep".to_string()]);
+        assert!(excludes.blocks(Path::new("/keep")));
+        assert!(excludes.blocks(Path::new("/keep/deep/nested/file.txt")));
+        // A sibling whose name merely starts the same is not swept in.
+        assert!(!excludes.blocks(Path::new("/keeper/file.txt")));
+    }
+
+    #[test]
+    fn no_patterns_protects_nothing() {
+        // The early return has to mean "nothing was asked for", not
+        // "everything matches".
+        let excludes = Excludes::new(Vec::new());
+        assert!(!excludes.blocks(Path::new("/anything/at/all")));
     }
 
     #[test]
