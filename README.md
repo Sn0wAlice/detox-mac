@@ -139,7 +139,7 @@ detox orphans --clean
 detox history
 detox undo
 
-# The applications you never open, then remove one properly
+# The applications you stopped opening, then remove one properly
 detox apps --unused 180
 detox uninstall "Screen Studio"
 
@@ -624,19 +624,35 @@ Tor Browser — 479.6 MB
 Which application to remove is the other half of the question:
 
 ```bash
-detox apps --unused 180
+detox apps --unused 90
 ```
 
 ```
-Applications untouched for 180 day(s) (24 — 5.51 GB)
-    696.0 MB  Google Chrome Canary               never opened
-    543.1 MB  Screen Studio                      never opened
-    481.8 MB  Telegram Lite                      never opened
+Applications untouched for 90 day(s) (4 — 1.21 GB)
+    696.0 MB  Google Chrome Canary               last active 100d ago
+    435.6 MB  OBS                                last active 101d ago
+     56.8 MB  WiFiman Desktop                    last active 148d ago
+     46.5 MB  uBlock Origin Lite                 last active 152d ago
 ```
 
-Size alone says which application is big. Size next to the last time it was
-opened — Spotlight's `kMDItemLastUsedDate`, not the modification time — says
-which one to actually remove.
+Size alone says which application is big. Size next to the last time it ran
+says which one to actually remove — and that date is the part worth being
+careful about:
+
+- `last opened Nd ago` is Spotlight's own launch record,
+  `kMDItemLastUsedDate`. The direct answer, when it exists.
+- `last active Nd ago` means no launch is on record, but the application's
+  preferences, caches or saved state were written then, which takes a running
+  application. macOS lets the launch date lapse on anything not opened
+  recently, so on a machine with real history this is most of the list.
+- `no trace of use, installed Nd ago` is an absence rather than a finding:
+  nothing here remembers it running, so the count is how long the bundle has
+  sat there. An application installed last week cannot be a year idle, and it
+  will not appear under `--unused 365`.
+
+An application that cannot be dated at all is left out of the list rather than
+counted as unused. Being unrecognised is not evidence of disuse, and a tool
+that offers to delete things has no business guessing in that direction.
 
 ---
 

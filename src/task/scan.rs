@@ -16,9 +16,30 @@ pub struct Entry {
     pub name: String,
     pub path: PathBuf,
     pub bytes: u64,
-    /// Days since it was last opened, when Spotlight knows.
+    /// Days since it was last used, when that could be established at all.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unused_days: Option<u64>,
+    /// What `unused_days` was read from. Applications only: for a loose file
+    /// Spotlight is the only source there is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<Evidence>,
+}
+
+/// What a day count about an application actually rests on.
+///
+/// Worth carrying around because the three are not equally strong, and a tool
+/// that proposes deletions has to say which one it has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Evidence {
+    /// Spotlight recorded the launch itself. The direct answer.
+    Launch,
+    /// No launch on record, but the application's own preferences, caches or
+    /// saved state were written then, which takes a running application.
+    Traces,
+    /// Nothing on this machine remembers it running, so the count is the age
+    /// of the bundle: how long it has sat there without leaving a trace.
+    Install,
 }
 
 /// Installed application bundles, unmeasured.
@@ -59,6 +80,7 @@ pub fn measure_application(path: &Path) -> Entry {
         bytes: fsx::size_of(path),
         path: path.to_path_buf(),
         unused_days: None,
+        evidence: None,
     }
 }
 
@@ -85,6 +107,7 @@ pub fn large_files(
                     path: path.to_path_buf(),
                     bytes: size,
                     unused_days: None,
+                    evidence: None,
                 });
             }
         }
@@ -101,8 +124,10 @@ pub fn large_files(
 /// installer is written once and never touched again, whether it was run or
 /// not. `kMDItemLastUsedDate` is the one that answers "do you use this?".
 ///
-/// `None` when Spotlight has nothing on it — an unindexed volume, or a file
-/// that has genuinely never been opened.
+/// `None` when Spotlight has nothing on it, which is not the same as never
+/// opened: the attribute is missing on an unindexed volume, and macOS also
+/// lets it lapse on anything not opened recently. Silence here means unknown
+/// — see [`application_last_use`] for what to do about it.
 pub fn days_since_used(path: &Path) -> Option<u64> {
     let output = cmd::run(
         "mdls",
@@ -117,6 +142,74 @@ pub fn days_since_used(path: &Path) -> Option<u64> {
 
     let epoch = format::parse_spotlight_date(&output.stdout)?;
     Some(format::epoch_now().saturating_sub(epoch) / 86_400)
+}
+
+/// Days since an application was last used, and what that rests on.
+///
+/// Spotlight alone is not enough here. It keeps `kMDItemLastUsedDate` for
+/// applications launched recently and drops it for the rest, so on a real
+/// machine every application worth reporting comes back empty — and reading
+/// that emptiness as "never opened" flags things the owner uses monthly.
+///
+/// So when Spotlight says nothing, ask the application's own files: running
+/// one writes preferences, caches, saved state. Failing that, fall back to
+/// the age of the bundle, which is a ceiling rather than an answer — an
+/// application installed last week cannot have been idle for a year.
+pub fn application_last_use(bundle: &Path) -> (u64, Evidence) {
+    resolve(
+        days_since_used(bundle),
+        || days_since_traces(bundle),
+        || fsx::age_days(bundle),
+    )
+}
+
+/// Picks the strongest of the three signals that actually answered.
+///
+/// The later two are closures because reaching for them means walking the
+/// home library, which is wasted work when Spotlight already knew.
+fn resolve(
+    launch: Option<u64>,
+    traces: impl FnOnce() -> Option<u64>,
+    install: impl FnOnce() -> u64,
+) -> (u64, Evidence) {
+    if let Some(days) = launch {
+        return (days, Evidence::Launch);
+    }
+    match traces() {
+        Some(days) => (days, Evidence::Traces),
+        None => (install(), Evidence::Install),
+    }
+}
+
+/// Days since anything belonging to an application was last written.
+///
+/// The most recent of its support files wins: caches go stale, preferences do
+/// not, and either one being touched means the application ran.
+fn days_since_traces(bundle: &Path) -> Option<u64> {
+    let mut latest = 0;
+
+    if let Some(bundle_id) = super::orphans::bundle_id(bundle) {
+        latest = super::orphans::support_entries(&bundle_id, bundle)
+            .iter()
+            .map(|(_, path)| fsx::mtime(path))
+            .max()
+            .unwrap_or(0);
+    }
+
+    // Plenty of applications name their support directory after themselves
+    // instead of after their identifier, and those tend to be the ones that
+    // write to it constantly. A display name is too loose to delete by, so
+    // `uninstall` keeps ignoring these — but it is safe to *read*: a wrong
+    // match can only make an application look more recently used, while a
+    // miss means offering to delete something in weekly use.
+    let name = bundle.file_stem().unwrap_or_default();
+    for dir in ["Application Support", "Caches", "Logs"] {
+        latest = latest.max(fsx::mtime(
+            &fsx::home_join(&format!("Library/{dir}")).join(name),
+        ));
+    }
+
+    (latest > 0).then(|| format::epoch_now().saturating_sub(latest) / 86_400)
 }
 
 /// Extensions of the things people download, install once, and forget.
@@ -171,6 +264,7 @@ pub fn dormant(
                 path: path.clone(),
                 bytes: fsx::size_of(path),
                 unused_days: Some(days),
+                evidence: None,
             })
         },
         |_, path| {
@@ -187,4 +281,44 @@ pub fn dormant(
 /// Sum of the sizes of a list of entries.
 pub fn total(entries: &[Entry]) -> u64 {
     entries.iter().map(|entry| entry.bytes).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_application_nothing_remembers_is_dated_from_its_install() {
+        // The bug this pins: macOS lets `kMDItemLastUsedDate` lapse on
+        // anything not opened recently, so Spotlight goes quiet on almost
+        // every application worth reporting. Reading that silence as "never
+        // opened" made an "unused for N days" filter match everything, at
+        // any N. Silence now falls through to the application's own files,
+        // and then to the age of the bundle — which is a ceiling: something
+        // installed today cannot have been idle for a year.
+        assert_eq!(
+            resolve(None, || None, || 12),
+            (12, Evidence::Install),
+            "with nothing to go on, the install age is all that can be said"
+        );
+    }
+
+    #[test]
+    fn the_strongest_signal_wins_and_the_rest_go_unread() {
+        // Spotlight answered, so neither fallback should even be reached.
+        assert_eq!(
+            resolve(
+                Some(4),
+                || panic!("traces read anyway"),
+                || panic!("age read anyway")
+            ),
+            (4, Evidence::Launch)
+        );
+        // It did not, so the files belonging to the application decide, and
+        // the bundle's age stays out of it.
+        assert_eq!(
+            resolve(None, || Some(90), || panic!("age read anyway")),
+            (90, Evidence::Traces)
+        );
+    }
 }

@@ -174,7 +174,7 @@ pub enum Command {
         #[arg(short, long, value_name = "N", default_value_t = 15)]
         top: usize,
 
-        /// Only those not opened for N days, according to Spotlight.
+        /// Only those with no sign of use for N days.
         #[arg(short, long, value_name = "DAYS")]
         unused: Option<u64>,
     },

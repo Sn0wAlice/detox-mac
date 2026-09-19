@@ -691,7 +691,9 @@ fn apps(ctx: &Ctx, top: usize, unused: Option<u64>) -> bool {
             // Size alone says which application is big. Size next to the last
             // time it was opened says which one to actually remove.
             if unused.is_some() {
-                entry.unused_days = scan::days_since_used(bundle);
+                let (days, evidence) = scan::application_last_use(bundle);
+                entry.unused_days = Some(days);
+                entry.evidence = Some(evidence);
             }
             entry
         },
@@ -706,8 +708,10 @@ fn apps(ctx: &Ctx, top: usize, unused: Option<u64>) -> bool {
     }
 
     if let Some(days) = unused {
-        // Never opened is the strongest case of all, so it counts as dormant.
-        apps.retain(|app| app.unused_days.is_none_or(|used| used >= days));
+        // Only what is known to be idle. An application nothing can date is
+        // not thereby unused, and listing it as such is how this filter
+        // proposed deleting things its owner opens every month.
+        apps.retain(|app| app.unused_days.is_some_and(|used| used >= days));
     }
     apps.sort_by_key(|app| std::cmp::Reverse(app.bytes));
     let shown = take(&apps, top);
@@ -728,10 +732,20 @@ fn apps(ctx: &Ctx, top: usize, unused: Option<u64>) -> bool {
         format::size(scan::total(&apps))
     ));
     for app in shown {
-        let note = match app.unused_days {
-            Some(days) => p.dim(&format!("last opened {days}d ago")),
-            None if unused.is_some() => p.dim("never opened"),
-            None => String::new(),
+        // The wording carries the evidence: "opened" is Spotlight's own
+        // record, "active" is the application's files having been written,
+        // and the last one is an absence rather than a finding.
+        let note = match (app.unused_days, app.evidence) {
+            (Some(days), Some(scan::Evidence::Launch)) => {
+                p.dim(&format!("last opened {days}d ago"))
+            }
+            (Some(days), Some(scan::Evidence::Traces)) => {
+                p.dim(&format!("last active {days}d ago"))
+            }
+            (Some(days), Some(scan::Evidence::Install)) => {
+                p.dim(&format!("no trace of use, installed {days}d ago"))
+            }
+            _ => String::new(),
         };
         p.info(
             format!(
@@ -745,6 +759,9 @@ fn apps(ctx: &Ctx, top: usize, unused: Option<u64>) -> bool {
     }
     if shown.len() < apps.len() {
         p.info(p.dim(&format!("  … and {} more", apps.len() - shown.len())));
+    }
+    if unused.is_some() && apps.is_empty() {
+        p.item(p.dim("everything installed shows use more recently than that"));
     }
     if unused.is_some() && !apps.is_empty() {
         p.info("");

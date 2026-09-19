@@ -273,14 +273,13 @@ pub fn find(installed_ids: &[String], progress: &mut impl FnMut(&str)) -> Vec<Le
     leftovers
 }
 
-/// Everything one bundle identifier left behind, whether or not the
-/// application is still installed.
+/// Every entry in the usual haunts that belongs to one identifier, unmeasured.
 ///
-/// Used by `uninstall`, where the identifier is known and the question is not
-/// "is this an orphan?" but "what else belongs to it?".
-pub fn leftovers_of(bundle_id: &str, exclude_bundle: &Path) -> Leftover {
-    let mut items = Vec::new();
-    let mut sizer = fsx::Sizer::new();
+/// Walking a container to add up its bytes is the slow part, so it is left to
+/// the caller: asking *whether* something is there, or when it was last
+/// written, costs one `read_dir` per haunt.
+pub fn support_entries(bundle_id: &str, exclude_bundle: &Path) -> Vec<(&'static str, PathBuf)> {
+    let mut found = Vec::new();
 
     for (kind, dir, extension) in haunts() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -308,10 +307,27 @@ pub fn leftovers_of(bundle_id: &str, exclude_bundle: &Path) -> Leftover {
                 continue;
             }
 
-            let bytes = sizer.size_of(&path);
-            items.push(Item { kind, path, bytes });
+            found.push((kind, path));
         }
     }
+
+    found
+}
+
+/// Everything one bundle identifier left behind, whether or not the
+/// application is still installed.
+///
+/// Used by `uninstall`, where the identifier is known and the question is not
+/// "is this an orphan?" but "what else belongs to it?".
+pub fn leftovers_of(bundle_id: &str, exclude_bundle: &Path) -> Leftover {
+    let mut sizer = fsx::Sizer::new();
+    let items: Vec<Item> = support_entries(bundle_id, exclude_bundle)
+        .into_iter()
+        .map(|(kind, path)| {
+            let bytes = sizer.size_of(&path);
+            Item { kind, path, bytes }
+        })
+        .collect();
 
     Leftover {
         bundle_id: bundle_id.to_string(),
