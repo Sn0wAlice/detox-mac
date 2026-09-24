@@ -250,17 +250,21 @@ fn take<T>(items: &[T], top: usize) -> &[T] {
 
 /// Measures several targets, showing a progress bar.
 fn measure_targets(ctx: &Ctx, targets: &[Target]) -> Vec<clean::Measure> {
-    let mut progress = ctx.printer.bar("Measuring", targets.len());
-    let measures: Vec<clean::Measure> = targets
-        .iter()
-        .map(|&target| {
-            progress.tick(target.label());
-            let measure = clean::measure(target, ctx.min_age_days);
-            progress.advance(target.label());
-            measure
-        })
-        .collect();
-    progress.finish();
+    // Side by side: the slow targets wait on macOS (TCC refusals, `docker`,
+    // `brew`), not on the CPU, so they need not queue behind each other.
+    let progress = std::sync::Mutex::new(ctx.printer.bar("Measuring", targets.len()));
+    let measures: Vec<clean::Measure> = par::map(
+        targets,
+        |&target| clean::measure(target, ctx.min_age_days),
+        |_, target| {
+            if let Ok(mut bar) = progress.lock() {
+                bar.advance(target.label());
+            }
+        },
+    );
+    if let Ok(mut bar) = progress.lock() {
+        bar.finish();
+    }
 
     // Hand the figures to whichever `clean` comes next, so it does not walk
     // the same disk over again.
@@ -786,22 +790,27 @@ fn render_disk_delta(ctx: &Ctx, before: Option<u64>, announced: u64) {
 
 fn apps(ctx: &Ctx, top: usize, unused: Option<u64>) -> bool {
     let bundles = scan::application_bundles();
+    let opened = match unused {
+        Some(_) => scan::days_since_used(&bundles),
+        None => vec![None; bundles.len()],
+    };
+    let bundles: Vec<(PathBuf, Option<u64>)> = bundles.into_iter().zip(opened).collect();
     let progress = std::sync::Mutex::new(ctx.printer.bar("Measuring", bundles.len()));
 
     let mut apps: Vec<scan::Entry> = par::map(
         &bundles,
-        |bundle| {
+        |(bundle, opened)| {
             let mut entry = scan::measure_application(bundle);
             // Size alone says which application is big. Size next to the last
             // time it was opened says which one to actually remove.
             if unused.is_some() {
-                let (days, evidence) = scan::application_last_use(bundle);
+                let (days, evidence) = scan::application_last_use(bundle, *opened);
                 entry.unused_days = Some(days);
                 entry.evidence = Some(evidence);
             }
             entry
         },
-        |_, bundle| {
+        |_, (bundle, _)| {
             if let Ok(mut bar) = progress.lock() {
                 bar.advance(&bundle.file_stem().unwrap_or_default().to_string_lossy());
             }
@@ -1139,14 +1148,18 @@ fn dev_residue(
         languages: filter.lang.clone(),
     };
 
-    let mut walk = p.spinner("Looking for projects");
-    let mut seen = 0usize;
-    let mut residue = dev::candidates(&criteria, &mut |dir| {
-        seen += 1;
-        walk.done_count(seen);
-        walk.tick(&format::tilde(dir));
+    let walk = std::sync::Mutex::new((p.spinner("Looking for projects"), 0usize));
+    let mut residue = dev::candidates(&criteria, &|dir| {
+        if let Ok(mut walk) = walk.lock() {
+            walk.1 += 1;
+            let seen = walk.1;
+            walk.0.done_count(seen);
+            walk.0.tick(&format::tilde(dir));
+        }
     });
-    walk.finish();
+    if let Ok(mut walk) = walk.lock() {
+        walk.0.finish();
+    }
 
     let mut sizing = p.bar("Measuring", residue.len());
     for entry in &mut residue {

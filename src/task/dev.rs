@@ -198,9 +198,15 @@ const SKIPPED: &[&str] = &["Library", "Applications", ".Trash", "Pictures", "Mov
 ///
 /// Sizing is by far the slow part, so it is left to [`measure`]: the caller can
 /// then report progress over a known number of directories.
-pub fn candidates(filter: &Filter, progress: &mut impl FnMut(&Path)) -> Vec<Residue> {
-    let mut found = Vec::new();
-    visit(&filter.root, 0, filter, &mut found, progress);
+pub fn candidates(filter: &Filter, progress: &(impl Fn(&Path) + Sync)) -> Vec<Residue> {
+    let states = crate::sys::par::drain(
+        vec![(filter.root.clone(), 0)],
+        Vec::new,
+        |found, (dir, depth), extra| visit(&dir, depth, filter, found, extra, progress),
+    );
+    let mut found: Vec<Residue> = states.into_iter().flatten().collect();
+    // Threads finish in any order; the listing should not.
+    found.sort_by(|a, b| a.path.cmp(&b.path));
     found
 }
 
@@ -209,12 +215,14 @@ pub fn measure(residue: &mut Residue) {
     residue.bytes = fsx::size_of(&residue.path);
 }
 
+/// Looks at one directory, handing the subdirectories worth entering back.
 fn visit(
     dir: &Path,
     depth: usize,
     filter: &Filter,
     found: &mut Vec<Residue>,
-    progress: &mut impl FnMut(&Path),
+    extra: &mut Vec<(PathBuf, usize)>,
+    progress: &(impl Fn(&Path) + Sync),
 ) {
     if depth > filter.max_depth {
         return;
@@ -292,7 +300,7 @@ fn visit(
         if name.starts_with('.') || SKIPPED.contains(&name.as_str()) || claimed.contains(&name) {
             continue;
         }
-        visit(&dir.join(name), depth + 1, filter, found, progress);
+        extra.push((dir.join(name), depth + 1));
     }
 }
 

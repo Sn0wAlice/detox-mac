@@ -10,7 +10,7 @@ use std::time::Duration;
 use serde::Serialize;
 
 use super::agents;
-use crate::sys::{cmd, machine};
+use crate::sys::{cmd, machine, par};
 
 /// A live process.
 #[derive(Debug, Clone, Serialize)]
@@ -71,14 +71,18 @@ impl Snapshot {
 ///
 /// `include_system` keeps Apple processes and system daemons.
 pub fn snapshot(include_system: bool) -> Snapshot {
-    let processes = running_processes();
+    // `top` alone takes over half a second whatever it is asked; everything
+    // else runs while it does.
+    let (processes, autostart) = std::thread::scope(|scope| {
+        let autostart = scope.spawn(autostart_groups);
+        (running_processes(), autostart.join().unwrap_or_default())
+    });
     let by_pid: HashMap<u32, usize> = processes
         .iter()
         .enumerate()
         .map(|(index, process)| (process.pid, index))
         .collect();
 
-    let autostart = autostart_groups();
     let mut groups: HashMap<String, Group> = HashMap::new();
 
     for process in &processes {
@@ -208,13 +212,17 @@ fn is_system(path: &str) -> bool {
 
 /// Lists processes with their memory footprint.
 fn running_processes() -> Vec<Process> {
-    let Ok(output) = cmd::run(
-        "ps",
-        &["-axwwo", "pid=,ppid=,rss=,%cpu=,etime=,user=,comm="],
-    ) else {
+    let (listing, footprints) = std::thread::scope(|scope| {
+        let footprints = scope.spawn(footprints);
+        let listing = cmd::run(
+            "ps",
+            &["-axwwo", "pid=,ppid=,rss=,%cpu=,etime=,user=,comm="],
+        );
+        (listing, footprints.join().unwrap_or_default())
+    });
+    let Ok(output) = listing else {
         return Vec::new();
     };
-    let footprints = footprints();
 
     output
         .stdout
@@ -309,8 +317,14 @@ fn free_percent() -> Option<u8> {
 fn autostart_groups() -> HashMap<String, Vec<String>> {
     let mut groups: HashMap<String, Vec<String>> = HashMap::new();
 
-    for agent in agents::collect().iter().filter(|agent| !agent.apple) {
-        let Some(program) = agent_program(&agent.path) else {
+    let agents: Vec<agents::Agent> = agents::collect()
+        .into_iter()
+        .filter(|agent| !agent.apple)
+        .collect();
+    // One `plutil` per agent: spread them out.
+    let programs = par::map(&agents, |agent| agent_program(&agent.path), |_, _| {});
+    for (agent, program) in agents.iter().zip(programs) {
+        let Some(program) = program else {
             continue;
         };
         let name = match bundle_of(&program) {

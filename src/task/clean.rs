@@ -396,10 +396,14 @@ impl Measure {
 /// be listed at all. Skipping one quietly is how an unreadable `~/.Trash`
 /// used to measure a confident 0 B.
 fn entries_of(dirs: &[&PathBuf], min_age_days: u64) -> (Vec<PathBuf>, usize) {
+    // In parallel: a sandboxed container macOS refuses costs a few
+    // milliseconds of TCC each, and there are hundreds of them.
+    let listed = crate::sys::par::map(dirs, |dir| fsx::entries_of(dir), |_, _| {});
+
     let mut entries = Vec::new();
     let mut unreadable = 0;
-    for dir in dirs {
-        let Ok(found) = fsx::entries_of(dir) else {
+    for found in listed {
+        let Ok(found) = found else {
             unreadable += 1;
             continue;
         };
@@ -758,7 +762,14 @@ fn homebrew_cache() -> Result<PathBuf, String> {
 fn ds_store_files() -> (Vec<(PathBuf, u64)>, usize) {
     let files = Mutex::new(Vec::new());
 
-    let sizer = fsx::walk_files(&fsx::home(), 12, &|path, size| {
+    // Finder only leaves these where someone browsed, which is never inside
+    // a hidden directory nor a build tree — and build trees are most of a
+    // developer's home: 998k of 1.18M files on the machine this was tuned on.
+    let prune = |name: &std::ffi::OsStr| {
+        name.as_encoded_bytes().first() == Some(&b'.') || name == "target" || name == "__pycache__"
+    };
+    let wanted = |name: &std::ffi::OsStr| name == ".DS_Store";
+    let sizer = fsx::walk_files(&fsx::home(), 12, &prune, &wanted, &|path, size| {
         if path.file_name().is_some_and(|name| name == ".DS_Store") {
             if let Ok(mut found) = files.lock() {
                 found.push((path.to_path_buf(), size));

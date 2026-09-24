@@ -96,7 +96,7 @@ pub fn large_files(
     let files = Mutex::new(Vec::new());
     let seen = AtomicUsize::new(0);
 
-    fsx::walk_files(root, max_depth, &|path, size| {
+    fsx::walk_files(root, max_depth, &|_| false, &|_| true, &|path, size| {
         let count = seen.fetch_add(1, Ordering::Relaxed) + 1;
         progress(count, path);
 
@@ -128,20 +128,36 @@ pub fn large_files(
 /// opened: the attribute is missing on an unindexed volume, and macOS also
 /// lets it lapse on anything not opened recently. Silence here means unknown
 /// — see [`application_last_use`] for what to do about it.
-pub fn days_since_used(path: &Path) -> Option<u64> {
-    let output = cmd::run(
-        "mdls",
-        &[
-            "-name",
-            "kMDItemLastUsedDate",
-            "-raw",
-            &path.to_string_lossy(),
-        ],
-    )
-    .ok()?;
+///
+/// One `mdls` for every path: each call costs about 60 ms of Spotlight
+/// start-up, which a list of applications paid once per entry.
+pub fn days_since_used(paths: &[PathBuf]) -> Vec<Option<u64>> {
+    let now = format::epoch_now();
+    let mut days = Vec::with_capacity(paths.len());
 
-    let epoch = format::parse_spotlight_date(&output.stdout)?;
-    Some(format::epoch_now().saturating_sub(epoch) / 86_400)
+    // Chunked, to stay far from the argument-length limit.
+    for chunk in paths.chunks(256) {
+        let mut args = vec![
+            "-name".to_string(),
+            "kMDItemLastUsedDate".to_string(),
+            "-raw".to_string(),
+        ];
+        args.extend(chunk.iter().map(|path| path.to_string_lossy().to_string()));
+
+        // With several paths, `-raw` separates the values with NULs.
+        let values: Vec<String> = cmd::run("mdls", &args)
+            .map(|output| output.stdout.split('\0').map(str::to_string).collect())
+            .unwrap_or_default();
+        for index in 0..chunk.len() {
+            days.push(
+                values
+                    .get(index)
+                    .and_then(|value| format::parse_spotlight_date(value))
+                    .map(|epoch| now.saturating_sub(epoch) / 86_400),
+            );
+        }
+    }
+    days
 }
 
 /// Days since an application was last used, and what that rests on.
@@ -155,9 +171,11 @@ pub fn days_since_used(path: &Path) -> Option<u64> {
 /// one writes preferences, caches, saved state. Failing that, fall back to
 /// the age of the bundle, which is a ceiling rather than an answer — an
 /// application installed last week cannot have been idle for a year.
-pub fn application_last_use(bundle: &Path) -> (u64, Evidence) {
+///
+/// `launch` is what [`days_since_used`] said for it.
+pub fn application_last_use(bundle: &Path, launch: Option<u64>) -> (u64, Evidence) {
     resolve(
-        days_since_used(bundle),
+        launch,
         || days_since_traces(bundle),
         || fsx::age_days(bundle),
     )
@@ -249,13 +267,19 @@ pub fn dormant(
         .filter(|path| !installers_only || path.is_dir() || is_installer(path))
         .collect();
 
+    // Spotlight knows when it was last opened; the modification time only
+    // knows when it was downloaded, which is never the question.
+    let opened: Vec<(PathBuf, Option<u64>)> = candidates
+        .iter()
+        .cloned()
+        .zip(days_since_used(&candidates))
+        .collect();
+
     let seen = AtomicUsize::new(0);
     let found = crate::sys::par::map(
-        &candidates,
-        |path| {
-            // Spotlight knows when it was last opened; the modification time
-            // only knows when it was downloaded, which is never the question.
-            let days = days_since_used(path).unwrap_or_else(|| fsx::age_days(path));
+        &opened,
+        |(path, opened)| {
+            let days = opened.unwrap_or_else(|| fsx::age_days(path));
             if days < min_days {
                 return None;
             }
@@ -267,7 +291,7 @@ pub fn dormant(
                 evidence: None,
             })
         },
-        |_, path| {
+        |_, (path, _)| {
             let count = seen.fetch_add(1, Ordering::Relaxed) + 1;
             progress(count, path);
         },

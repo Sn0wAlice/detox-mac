@@ -171,8 +171,11 @@ fn collect_bundles(dir: &Path, depth: usize, found: &mut Vec<PathBuf>) {
 /// Reads `CFBundleIdentifier` out of a bundle, binary plist or not.
 pub fn bundle_id(bundle: &Path) -> Option<String> {
     let plist = bundle.join("Contents/Info.plist");
-    if !plist.is_file() {
-        return None;
+    let bytes = std::fs::read(&plist).ok()?;
+    // Most are XML, and reading one key out of those costs nothing; `plutil`
+    // is a 5 ms process, once per bundle, over hundreds of bundles.
+    if !bytes.starts_with(b"bplist") {
+        return xml_string(&String::from_utf8_lossy(&bytes), "CFBundleIdentifier");
     }
     let output = cmd::run(
         "plutil",
@@ -189,6 +192,23 @@ pub fn bundle_id(bundle: &Path) -> Option<String> {
 
     let id = output.stdout.trim().to_string();
     (!id.is_empty()).then_some(id)
+}
+
+/// The `<string>` that follows `<key>{key}</key>` in an XML property list.
+fn xml_string(xml: &str, key: &str) -> Option<String> {
+    let after = xml.split_once(&format!("<key>{key}</key>"))?.1.trim_start();
+    let value = after
+        .strip_prefix("<string>")?
+        .split_once("</string>")?
+        .0
+        .trim();
+    let value = value
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&");
+    (!value.is_empty()).then_some(value)
 }
 
 /// The places an application leaves things behind, and what to call them.
@@ -494,6 +514,54 @@ mod tests {
         assert_eq!(canonical_id("com.acme.app"), "com.acme.app");
         // A ten-letter first segment with no digit is a real identifier.
         assert_eq!(canonical_id("cloudflare.com.x"), "cloudflare.com.x");
+    }
+
+    #[test]
+    fn reads_the_identifier_of_an_xml_plist() {
+        let xml = "<dict>\n\t<key>CFBundleName</key>\n\t<string>Demo</string>\n\t<key>CFBundleIdentifier</key>\n\t<string>com.acme.demo</string>\n</dict>";
+        assert_eq!(
+            xml_string(xml, "CFBundleIdentifier").as_deref(),
+            Some("com.acme.demo")
+        );
+        assert_eq!(xml_string(xml, "Missing"), None);
+        // A key whose value is not a string is not one.
+        assert_eq!(
+            xml_string("<key>CFBundleIdentifier</key><true/>", "CFBundleIdentifier"),
+            None
+        );
+    }
+
+    #[test]
+    fn xml_and_plutil_agree_on_installed_bundles() {
+        // Every XML Info.plist under /Applications, read both ways.
+        let Ok(apps) = std::fs::read_dir("/Applications") else {
+            return;
+        };
+        for app in apps.flatten().map(|e| e.path()) {
+            let plist = app.join("Contents/Info.plist");
+            let Ok(bytes) = std::fs::read(&plist) else {
+                continue;
+            };
+            if bytes.starts_with(b"bplist") {
+                continue;
+            }
+            let fast = xml_string(&String::from_utf8_lossy(&bytes), "CFBundleIdentifier");
+            let slow = cmd::run(
+                "plutil",
+                &[
+                    "-extract",
+                    "CFBundleIdentifier",
+                    "raw",
+                    "-o",
+                    "-",
+                    &plist.to_string_lossy(),
+                ],
+            )
+            .ok()
+            .map(|out| out.stdout.trim().to_string())
+            .filter(|id| !id.is_empty());
+            assert_eq!(fast, slow, "{}", plist.display());
+        }
     }
 
     #[test]

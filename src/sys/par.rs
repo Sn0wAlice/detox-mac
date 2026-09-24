@@ -4,8 +4,8 @@
 //! pulling from one shared cursor is most of what parallelism buys here — and
 //! it costs no dependency and no scheduler.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Condvar, Mutex};
 
 /// How many threads to use. Bounded: past a point, more threads only make the
 /// disk seek more.
@@ -106,10 +106,24 @@ where
         return vec![state];
     }
 
-    let pile = Mutex::new(seed);
-    // Threads that hold an item and may still hand more back.
-    let busy = AtomicUsize::new(0);
+    // The pile and the count of threads still working, under one lock: a
+    // thread that finds the pile empty sleeps until either changes, instead
+    // of spinning — spinning eight threads on `sched_yield` was most of the
+    // kernel time of a home-directory walk.
+    struct Shared<T> {
+        pile: Vec<T>,
+        busy: usize,
+    }
+    let shared = Mutex::new(Shared {
+        pile: seed,
+        busy: 0,
+    });
+    let changed = Condvar::new();
     let collected = Mutex::new(Vec::new());
+    let lock = || match shared.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -118,40 +132,42 @@ where
                 let mut extra = Vec::new();
 
                 loop {
-                    let next = {
-                        let mut pile = match pile.lock() {
-                            Ok(pile) => pile,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        match pile.pop() {
-                            Some(item) => {
-                                busy.fetch_add(1, Ordering::AcqRel);
-                                Some(item)
+                    let item = {
+                        let mut guard = lock();
+                        loop {
+                            if let Some(item) = guard.pile.pop() {
+                                guard.busy += 1;
+                                break Some(item);
                             }
-                            None => None,
+                            if guard.busy == 0 {
+                                break None;
+                            }
+                            guard = match changed.wait(guard) {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
                         }
                     };
-
-                    let Some(item) = next else {
-                        // Nothing to take. Another thread may still be about to
-                        // hand work back, so only stop once none of them can.
-                        if busy.load(Ordering::Acquire) == 0 {
-                            break;
-                        }
-                        std::thread::yield_now();
-                        continue;
+                    let Some(item) = item else {
+                        changed.notify_all();
+                        break;
                     };
 
                     work(&mut state, item, &mut extra);
 
-                    if !extra.is_empty() {
-                        let mut pile = match pile.lock() {
-                            Ok(pile) => pile,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        pile.append(&mut extra);
+                    let mut guard = lock();
+                    let handed_back = extra.len();
+                    guard.pile.append(&mut extra);
+                    guard.busy -= 1;
+                    let finished = guard.busy == 0 && guard.pile.is_empty();
+                    drop(guard);
+                    if finished {
+                        changed.notify_all();
+                    } else if handed_back > 0 {
+                        for _ in 0..handed_back.min(workers) {
+                            changed.notify_one();
+                        }
                     }
-                    busy.fetch_sub(1, Ordering::AcqRel);
                 }
 
                 if let Ok(mut all) = collected.lock() {

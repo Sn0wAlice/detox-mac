@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 
 use crate::config::Excludes;
 use crate::format;
-use crate::sys::par;
+use crate::sys::{bulk, par};
 
 /// Home directory of the current user.
 pub fn home() -> PathBuf {
@@ -88,10 +88,11 @@ fn occupied(meta: &fs::Metadata) -> u64 {
 
 /// `SF_DATALESS`: the file belongs to iCloud and its content is not on this
 /// disk. Only macOS has the flag.
+const SF_DATALESS: u32 = 0x4000_0000;
+
 #[cfg(target_os = "macos")]
 fn has_dataless_flag(meta: &fs::Metadata) -> bool {
     use std::os::macos::fs::MetadataExt as MacMetadataExt;
-    const SF_DATALESS: u32 = 0x4000_0000;
     meta.st_flags() & SF_DATALESS != 0
 }
 
@@ -201,6 +202,28 @@ impl Sizer {
         occupied(meta)
     }
 
+    /// The same as [`Sizer::count_file`], from what a bulk listing returned.
+    fn count_entry(&mut self, entry: &bulk::Entry) -> u64 {
+        let icloud_stub = Path::new(&entry.name)
+            .extension()
+            .is_some_and(|ext| ext == "icloud")
+            && entry.name.as_encoded_bytes().first() == Some(&b'.');
+        if entry.flags & SF_DATALESS != 0 || icloud_stub {
+            self.evicted += 1;
+            return 0;
+        }
+        if entry.nlink > 1 {
+            let mut counted = match self.counted.lock() {
+                Ok(counted) => counted,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if !counted.insert((entry.dev, entry.ino)) {
+                return 0;
+            }
+        }
+        entry.allocated
+    }
+
     fn note(&mut self, path: &Path, err: &io::Error) {
         if err.kind() == io::ErrorKind::PermissionDenied {
             self.denied += 1;
@@ -230,39 +253,36 @@ pub fn measure_all(roots: &[PathBuf]) -> (u64, Sizer) {
 pub fn measure_each(roots: &[PathBuf]) -> (Vec<u64>, Sizer) {
     let mut sizer = Sizer::new();
     let count = roots.len();
-    let seed: Vec<(PathBuf, usize)> = roots
-        .iter()
-        .cloned()
-        .enumerate()
-        .map(|(index, path)| (path, index))
-        .collect();
+    let mut totals = vec![0u64; count];
+
+    // Only directories go on the pile; a root that is a file or a link is
+    // counted here and now.
+    let mut seed = Vec::new();
+    for (index, path) in roots.iter().enumerate() {
+        match fs::symlink_metadata(path) {
+            Ok(meta) if meta.is_dir() => seed.push((path.clone(), index)),
+            Ok(meta) => totals[index] += sizer.count_file(path, &meta),
+            Err(err) => sizer.note(path, &err),
+        }
+    }
 
     let states = par::drain(
         seed,
         || (sizer.fork(), vec![0u64; count]),
-        |(worker, totals), (path, root), extra| {
-            let meta = match fs::symlink_metadata(&path) {
-                Ok(meta) => meta,
-                Err(err) => {
-                    worker.note(&path, &err);
-                    return;
+        |(worker, totals), (dir, root), extra| match bulk::read_dir(&dir) {
+            Ok(entries) => {
+                for entry in entries {
+                    if entry.kind == bulk::Kind::Dir {
+                        extra.push((dir.join(&entry.name), root));
+                    } else {
+                        totals[root] += worker.count_entry(&entry);
+                    }
                 }
-            };
-
-            if !meta.is_dir() {
-                totals[root] += worker.count_file(&path, &meta);
-                return;
             }
-
-            totals[root] += occupied(&meta);
-            match fs::read_dir(&path) {
-                Ok(entries) => extra.extend(entries.flatten().map(|entry| (entry.path(), root))),
-                Err(err) => worker.note(&path, &err),
-            }
+            Err(err) => worker.note(&dir, &err),
         },
     );
 
-    let mut totals = vec![0u64; count];
     for (worker, partial) in states {
         for (index, bytes) in partial.into_iter().enumerate() {
             totals[index] += bytes;
@@ -539,49 +559,56 @@ pub fn age_days(path: &Path) -> u64 {
 
 // ── walking ─────────────────────────────────────────────────────────────────
 
-/// Walks `root`, calling `visit` for every file with the space it occupies.
+/// Walks `root`, calling `visit` for every file whose name `wanted` accepts,
+/// with the space it occupies. Directories `prune` names are not entered.
 ///
 /// Symlinks are not followed, system and package-manager directories are
 /// skipped, and the depth is bounded. The walk is threaded, so `visit` must be
 /// callable from any of them. Returns what could not be read.
-pub fn walk_files(root: &Path, max_depth: usize, visit: &(impl Fn(&Path, u64) + Sync)) -> Sizer {
+pub fn walk_files(
+    root: &Path,
+    max_depth: usize,
+    prune: &(impl Fn(&std::ffi::OsStr) -> bool + Sync),
+    wanted: &(impl Fn(&std::ffi::OsStr) -> bool + Sync),
+    visit: &(impl Fn(&Path, u64) + Sync),
+) -> Sizer {
     let mut sizer = Sizer::new();
 
     let states = par::drain(
         vec![(root.to_path_buf(), 0usize)],
         || sizer.fork(),
-        |worker, (path, depth), extra| {
-            let Ok(meta) = fs::symlink_metadata(&path) else {
-                return;
-            };
-            if meta.file_type().is_symlink() {
-                return;
-            }
-
-            if !meta.is_dir() {
-                let bytes = worker.count_file(&path, &meta);
-                visit(&path, bytes);
-                return;
-            }
-
+        |worker, (dir, depth), extra| {
             if depth > max_depth {
                 return;
             }
             // The root is walked whatever it is called; only what is found
             // inside it can be skipped by name.
             let skip = depth > 0
-                && path
+                && dir
                     .file_name()
                     .is_some_and(|name| SKIPPED_DIRS.contains(&name.to_string_lossy().as_ref()));
             if skip {
                 return;
             }
 
-            match fs::read_dir(&path) {
-                Ok(entries) => {
-                    extra.extend(entries.flatten().map(|entry| (entry.path(), depth + 1)))
+            let entries = match bulk::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(err) => {
+                    worker.note(&dir, &err);
+                    return;
                 }
-                Err(err) => worker.note(&path, &err),
+            };
+            for entry in entries {
+                match entry.kind {
+                    bulk::Kind::Dir if prune(&entry.name) => {}
+                    bulk::Kind::Dir => extra.push((dir.join(&entry.name), depth + 1)),
+                    bulk::Kind::Symlink => {}
+                    _ if wanted(&entry.name) => {
+                        let bytes = worker.count_entry(&entry);
+                        visit(&dir.join(&entry.name), bytes);
+                    }
+                    _ => {}
+                }
             }
         },
     );
@@ -592,7 +619,7 @@ pub fn walk_files(root: &Path, max_depth: usize, visit: &(impl Fn(&Path, u64) + 
     sizer
 }
 
-/// Directories skipped when walking the home tree.
+/// Directory names never descended into by [`walk_files`].
 const SKIPPED_DIRS: &[&str] = &[
     "Library",
     "node_modules",

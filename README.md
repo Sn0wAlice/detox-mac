@@ -184,8 +184,23 @@ detox sys updates
 
 The walk is spread over a few threads pulling from one shared pile of
 directories, rather than splitting only the top level — a home directory is
-never balanced, and splitting the top of it leaves most threads idle. On this
-machine the `.DS_Store` sweep went from 18.6 s to 6.3 s that way.
+never balanced, and splitting the top of it leaves most threads idle. Each
+directory is read with `getattrlistbulk(2)`: names, types, sizes and inodes of
+a whole batch of entries in one system call, instead of one `lstat` per file.
+
+The `.DS_Store` sweep skips hidden directories and build trees (`target`,
+`__pycache__`), where Finder never leaves one — on a developer's machine that
+is most of the home directory. Targets are measured side by side, `mdls` is
+asked once for a whole list, and Info.plist files are read directly.
+
+| On a 1.1M-file home directory | 1.0.1 | 1.1.0 |
+|---|---:|---:|
+| `scan all` | 14.5 s | 2.3 s |
+| `apps --unused 90` | 0.85 s | 0.45 s |
+| `orphans` | 0.82 s | 0.54 s |
+| `files downloads` | 0.36 s | 0.07 s |
+| `files dev` | 0.44 s | 0.32 s |
+| `ram` | 0.70 s | 0.56 s |
 
 A `clean` that follows a `scan` within ten minutes reuses the figures the scan
 already paid for, entry by entry, and only re-measures what has been touched
@@ -498,12 +513,15 @@ detox undo 20260918-230512
 ```
 
 `undo` never overwrites: an original path that is occupied again is left alone
-and reported, as is anything no longer in the trash.
+and reported, as is anything no longer in the trash. `history` checks the trash
+as it is now — `undoable`, `partly 3/18`, `trash emptied` or `permanent` — and
+`undo` refuses a run whose entries are all gone.
 
 ### And still
 
 - **Dry run** (`-n`): exact measurement of what would go, zero modification.
-- **Apple agents are never disabled nor removed**, even with `--all-third-party`.
+- **Apple agents are never disabled nor removed**, even with `--all-third-party`,
+  and **Apple applications are never uninstalled**.
 - **Docker volumes are never pruned**: they hold your data.
 - **iOS simulators and iOS backups are excluded from `all`**.
 - **`trash-all` only touches your own trash** on each volume, never the other
@@ -586,7 +604,9 @@ someone's data:
   `Application Support/Sublime Text` — is never claimed, so the list is
   **shorter than what is really there**, by design.
 - An identifier related to an installed one counts as installed: helpers,
-  frameworks and extensions belong to their application.
+  frameworks and extensions belong to their application, and so does anything
+  from the **same vendor** — `com.docker.install` is not a leftover while
+  `com.docker.docker` is installed.
 - Installed means more than `/Applications`: preference panes count, and so do
   the applications that live inside `Application Support` — updaters, embedded
   CLIs — which is what keeps Chrome's updater off the list.
