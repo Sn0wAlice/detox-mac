@@ -2429,10 +2429,14 @@ fn list_agents(ctx: &Ctx, third_party_only: bool, scope: Option<Scope>) -> bool 
 
     let (apple, third_party) = agents::summary(&all);
     p.info("");
-    p.info(format!(
-        "  {third_party} third-party agent(s), {apple} Apple"
-    ));
-    if !third_party_only {
+    // Apple's own live under /System, which is not read: saying "0 Apple"
+    // would suggest there are none.
+    p.info(if apple > 0 {
+        format!("  {third_party} third-party agent(s), {apple} Apple")
+    } else {
+        format!("  {third_party} third-party agent(s) — Apple's own, under /System, are not listed")
+    });
+    if !third_party_only && apple > 0 {
         p.info(p.dim("  detox agents list --third-party   hide Apple's own"));
     }
     if third_party > 0 {

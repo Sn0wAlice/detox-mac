@@ -81,17 +81,38 @@ pub fn collect() -> Vec<Agent> {
     agents
 }
 
-/// Labels currently loaded according to `launchctl list`.
+/// Labels currently loaded, in the user's domain and in the system one.
+///
+/// `launchctl list` only answers for the caller's domain, so without the
+/// second read every LaunchDaemon showed as "not loaded", running or not.
 fn loaded_labels() -> HashSet<String> {
-    let Ok(output) = cmd::run("launchctl", &["list"]) else {
-        return HashSet::new();
-    };
+    let mut labels = HashSet::new();
 
-    output
-        .stdout
-        .lines()
+    if let Ok(output) = cmd::run("launchctl", &["list"]) {
+        labels.extend(
+            output
+                .stdout
+                .lines()
+                .skip(1)
+                .filter_map(|line| line.split('\t').nth(2))
+                .map(str::to_string),
+        );
+    }
+    // Readable without root.
+    if let Ok(output) = cmd::run("launchctl", &["print", "system"]) {
+        labels.extend(system_services(&output.stdout));
+    }
+
+    labels
+}
+
+/// Labels of the `services = { … }` block of `launchctl print system`.
+fn system_services(text: &str) -> Vec<String> {
+    text.lines()
+        .skip_while(|line| line.trim() != "services = {")
         .skip(1)
-        .filter_map(|line| line.split('\t').nth(2))
+        .take_while(|line| line.trim() != "}")
+        .filter_map(|line| line.split_whitespace().last())
         .map(str::to_string)
         .collect()
 }
@@ -191,6 +212,15 @@ pub fn summary(agents: &[Agent]) -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_the_system_services_block() {
+        let text = "system = {\n\tservices = {\n\t\t     529      - \tat.obdev.littlesnitch.daemon\n\t\t       0   (pe) \tcom.apple.lskdd\n\t}\n\tdisabled services = {\n\t\t\"x\" => enabled\n\t}\n}";
+        assert_eq!(
+            system_services(text),
+            ["at.obdev.littlesnitch.daemon", "com.apple.lskdd"]
+        );
+    }
 
     #[test]
     fn detects_apple_labels() {
