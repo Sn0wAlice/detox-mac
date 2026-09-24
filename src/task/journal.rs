@@ -42,6 +42,12 @@ impl Run {
     pub fn reversible(&self) -> bool {
         self.disposal.is_trash() && !self.moves.is_empty()
     }
+
+    /// How many of its entries are still in the trash. A `stat` answers even
+    /// without Full Disk Access, which listing `~/.Trash` would not.
+    pub fn left_in_trash(&self) -> usize {
+        self.moves.iter().filter(|entry| entry.to.exists()).count()
+    }
 }
 
 /// Directory holding the journal.

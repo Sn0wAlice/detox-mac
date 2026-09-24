@@ -509,7 +509,10 @@ fn render_next_clean(p: &Printer, measures: &[clean::Measure]) {
 
     p.info("");
     if worth.is_empty() && data.is_empty() {
-        p.info(p.dim("  Nothing worth cleaning here."));
+        // "Nothing" would be a guess when part of it could not be read.
+        if measures.iter().all(|m| m.unavailable.is_none()) {
+            p.info(p.dim("  Nothing worth cleaning here."));
+        }
         return;
     }
     if !worth.is_empty() {
@@ -1498,6 +1501,14 @@ fn uninstall(ctx: &Ctx, query: &str) -> bool {
         ));
         return false;
     };
+    // Its settings are the user's, and the bundle itself is sealed by SIP:
+    // all an attempt could do is wipe the first and fail on the second.
+    if orphans::is_apple(&bundle_id) {
+        p.error(format!(
+            "{name} is part of macOS — detox never uninstalls Apple applications"
+        ));
+        return false;
+    }
 
     // Removing an application out from under itself leaves half a process
     // running against files that no longer exist.
@@ -1615,12 +1626,27 @@ fn uninstall(ctx: &Ctx, query: &str) -> bool {
     }
 
     p.info("");
-    p.success(format!("{name} removed — {} item(s)", removal.removed));
-    for error in removal.errors.iter().take(5) {
-        p.error(error);
+    if ctx.dry_run {
+        p.success(format!(
+            "{name} — {} item(s) would go [dry run]",
+            removal.removed
+        ));
+        // Nothing was attempted: these are sizes that could not be read.
+        if !removal.errors.is_empty() {
+            p.warn(format!(
+                "{} item(s) could not be measured — {}",
+                removal.errors.len(),
+                fsx::full_disk_access_hint()
+            ));
+        }
+    } else {
+        p.success(format!("{name} removed — {} item(s)", removal.removed));
+        for error in removal.errors.iter().take(5) {
+            p.error(error);
+        }
     }
     render_disposal(ctx, removal.freed, removal.trashed);
-    removal.errors.is_empty()
+    ctx.dry_run || removal.errors.is_empty()
 }
 
 // ── scheduling ──────────────────────────────────────────────────────────────
@@ -1888,18 +1914,31 @@ fn history(ctx: &Ctx, top: usize) -> bool {
             format::datetime(run.epoch),
             format::truncate(&run.command, 22),
             size,
-            p.dim(if run.reversible() {
-                "undoable"
-            } else {
-                "permanent"
-            })
+            p.dim(&undo_state(run))
         ));
     }
 
     p.info("");
     p.info(p.dim(&format!("  {}", format::tilde(&journal::dir()))));
-    p.info(p.dim("  detox undo <ID>   puts a run back"));
+    if runs
+        .iter()
+        .any(|run| run.reversible() && run.left_in_trash() > 0)
+    {
+        p.info(p.dim("  detox undo <ID>   puts a run back"));
+    }
     true
+}
+
+/// What `undo` could still do for a run, checked against the trash as it is now.
+fn undo_state(run: &journal::Run) -> String {
+    if !run.reversible() {
+        return "permanent".to_string();
+    }
+    match run.left_in_trash() {
+        0 => "trash emptied".to_string(),
+        left if left == run.moves.len() => "undoable".to_string(),
+        left => format!("partly {left}/{}", run.moves.len()),
+    }
 }
 
 fn undo_run(ctx: &Ctx, id: Option<&str>) -> bool {
@@ -1913,6 +1952,13 @@ fn undo_run(ctx: &Ctx, id: Option<&str>) -> bool {
         return false;
     };
 
+    if run.reversible() && run.left_in_trash() == 0 {
+        p.error(format!(
+            "{}: the trash has been emptied since — nothing left to put back",
+            run.id
+        ));
+        return false;
+    }
     if !run.reversible() {
         p.error(format!(
             "{} removed {} for good — there is nothing to put back",
@@ -1971,7 +2017,8 @@ fn undo_run(ctx: &Ctx, id: Option<&str>) -> bool {
         p.error(error);
     }
     p.info(p.dim("  detox history   every run, and which can still be undone"));
-    result.errors.is_empty()
+    // Nothing put back is not a success, and must not earn a "run it for real".
+    result.errors.is_empty() && result.restored > 0
 }
 
 // ── memory ──────────────────────────────────────────────────────────────────
@@ -2560,7 +2607,41 @@ fn render_outcomes(ctx: &Ctx, outcomes: &[Outcome]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::without_dry_run;
+    use super::{undo_state, without_dry_run};
+    use crate::sys::fsx::{Disposal, Move};
+    use crate::task::journal::Run;
+
+    #[test]
+    fn undo_state_follows_the_trash() {
+        let dir = std::env::temp_dir().join("detox-mac-test-undo-state");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let kept = dir.join("kept");
+        std::fs::write(&kept, "x").unwrap();
+        let entry = |to: &std::path::Path| Move {
+            from: dir.join("from"),
+            to: to.to_path_buf(),
+            bytes: 1,
+        };
+        let mut run = Run {
+            id: "x".to_string(),
+            epoch: 0,
+            command: "clean".to_string(),
+            disposal: Disposal::Trash,
+            freed: 0,
+            trashed: 2,
+            removed: 2,
+            moves: vec![entry(&kept), entry(&dir.join("gone"))],
+        };
+        assert_eq!(undo_state(&run), "partly 1/2");
+        run.moves.truncate(1);
+        assert_eq!(undo_state(&run), "undoable");
+        std::fs::remove_file(&kept).unwrap();
+        assert_eq!(undo_state(&run), "trash emptied");
+        run.disposal = Disposal::Purge;
+        assert_eq!(undo_state(&run), "permanent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn run(line: &str) -> String {
         without_dry_run(line.split(' ').map(String::from))

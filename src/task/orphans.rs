@@ -278,14 +278,27 @@ fn canonical_id(name: &str) -> &str {
 /// Whether an identifier belongs to something still installed.
 ///
 /// A helper (`com.acme.app.helper`) counts as installed when its application
-/// is, and so does the other way round.
+/// is, and so does the other way round. So does anything from the same vendor
+/// (`com.docker.install` next to `com.docker.docker`): installers, updaters
+/// and shared containers rarely share the application's own identifier, and
+/// taking them for leftovers is how Docker's live update got trashed.
 fn is_installed(id: &str, installed: &[String]) -> bool {
     if is_apple(id) {
         return true;
     }
+    let vendor = vendor_of(id);
     installed.iter().any(|known| {
-        known == id || id.starts_with(&format!("{known}.")) || known.starts_with(&format!("{id}."))
+        known == id
+            || id.starts_with(&format!("{known}."))
+            || known.starts_with(&format!("{id}."))
+            || vendor.is_some() && vendor_of(known) == vendor
     })
+}
+
+/// The first two segments of an identifier: `com.docker` for `com.docker.install`.
+fn vendor_of(id: &str) -> Option<&str> {
+    let second_dot = id.match_indices('.').nth(1)?.0;
+    Some(&id[..second_dot])
 }
 
 /// Finds everything left behind by applications that are gone.
@@ -498,6 +511,15 @@ mod tests {
     }
 
     #[test]
+    fn the_same_vendor_is_never_an_orphan() {
+        let installed = vec!["com.docker.docker".to_string()];
+        assert!(is_installed("com.docker.install", &installed));
+        // Sharing only the top-level domain is not sharing a vendor.
+        assert!(!is_installed("com.dockerhub.tool", &installed));
+        assert!(!is_installed("com.xamarin.fontconfig", &installed));
+    }
+
+    #[test]
     fn an_application_bundle_covers_its_own_framework_ids() {
         // The bundle is `com.acme.app.framework`, the app `com.acme.app`.
         let installed = vec!["com.acme.app.framework".to_string()];
@@ -558,21 +580,16 @@ mod tests {
 
     #[test]
     fn a_name_that_is_only_a_prefix_is_not_a_child() {
-        // The gap that hid ImageOptim's extension: the identifier starts
-        // with the application's, but the next character is not a dot, so no
-        // relation rule covers it. It has to come from the bundle itself.
+        // The identifier starts with the application's, but the next
+        // character is not a dot: no parent/child rule applies. What covers
+        // ImageOptim's extension is the shared vendor, `net.pornel`.
         let installed = vec!["net.pornel.ImageOptim".to_string()];
-        assert!(!is_installed(
+        assert!(is_installed(
             "net.pornel.ImageOptimizeExtension",
             &installed
         ));
-
-        // Which it does, once the extension inside the bundle is read.
-        let installed = vec![
-            "net.pornel.ImageOptim".to_string(),
-            "net.pornel.ImageOptimizeExtension".to_string(),
-        ];
-        assert!(is_installed(
+        let installed = vec!["org.pornel.ImageOptim".to_string()];
+        assert!(!is_installed(
             "net.pornel.ImageOptimizeExtension",
             &installed
         ));

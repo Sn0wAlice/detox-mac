@@ -392,10 +392,15 @@ impl Measure {
 
 /// The entries a target would act on: everything in its directories, minus
 /// what is too recent to be considered idle.
-fn entries_of(dirs: &[&PathBuf], min_age_days: u64) -> Vec<PathBuf> {
+/// The entries of the target's directories, and how many of those could not
+/// be listed at all. Skipping one quietly is how an unreadable `~/.Trash`
+/// used to measure a confident 0 B.
+fn entries_of(dirs: &[&PathBuf], min_age_days: u64) -> (Vec<PathBuf>, usize) {
     let mut entries = Vec::new();
+    let mut unreadable = 0;
     for dir in dirs {
         let Ok(found) = fsx::entries_of(dir) else {
+            unreadable += 1;
             continue;
         };
         for path in found {
@@ -404,7 +409,7 @@ fn entries_of(dirs: &[&PathBuf], min_age_days: u64) -> Vec<PathBuf> {
             }
         }
     }
-    entries
+    (entries, unreadable)
 }
 
 /// Measures the reclaimable space of a target, changing nothing.
@@ -422,14 +427,15 @@ pub fn measure(target: Target, min_age_days: u64) -> Measure {
             // Every entry of the target measured in one pass: the threads share
             // one set of counted inodes, so a file hard-linked between two
             // package stores is counted once, not once per store.
-            let entries = entries_of(&existing, min_age_days);
+            let (entries, unlisted) = entries_of(&existing, min_age_days);
             let (each, sizer) = fsx::measure_each(&entries);
             let bytes = each.iter().sum();
             let items = entries.len();
+            let denied = sizer.denied + unlisted;
 
-            let mut measure = Measure::new(target, bytes, items, sizer.denied);
+            let mut measure = Measure::new(target, bytes, items, denied);
             measure.entries = entries.into_iter().zip(each).collect();
-            if sizer.denied > 0 && bytes == 0 {
+            if denied > 0 && bytes == 0 {
                 measure.unavailable =
                     Some(format!("unreadable — {}", fsx::full_disk_access_hint()));
             }
@@ -617,7 +623,15 @@ fn clean_dirs(
     }
 
     // The same list the measurement used: what was announced is what goes.
-    let entries = entries_of(&existing, ctx.min_age_days);
+    let (entries, unlisted) = entries_of(&existing, ctx.min_age_days);
+    if entries.is_empty() && unlisted > 0 {
+        // A failure, not a skip: what was asked for did not happen.
+        return Cleaned {
+            status: Status::Failed,
+            messages: vec![format!("unreadable — {}", fsx::full_disk_access_hint())],
+            ..Cleaned::skipped(target, "")
+        };
+    }
     let sizes = known.lookup(&entries);
     let removal = fsx::remove_measured(&entries, &sizes, policy);
 
