@@ -120,6 +120,12 @@ impl Printer {
         eprintln!("{} {}", self.paint(RED, "✗"), text.as_ref());
     }
 
+    /// A declined confirmation. Dry runs never ask, so `-n` is always news here.
+    pub fn cancelled(&self) {
+        self.line("Cancelled — nothing was touched.");
+        self.line(self.dim("  add -n to see what it would do, without being asked"));
+    }
+
     /// Banner for simulation mode.
     pub fn dry_run_banner(&self) {
         self.line(self.paint(YELLOW, "◆ Dry run — nothing will be modified."));

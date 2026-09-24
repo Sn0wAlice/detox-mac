@@ -53,7 +53,8 @@ pub fn run(cli: Cli) -> bool {
         printer.dry_run_banner();
     }
 
-    match cli.command {
+    let mutating = changes_something(&cli.command);
+    let ok = match cli.command {
         Command::Info => info(&ctx),
         Command::Scan {
             targets,
@@ -121,7 +122,65 @@ pub fn run(cli: Cli) -> bool {
             clap_complete::generate(shell, &mut command, name, &mut std::io::stdout());
             true
         }
+    };
+
+    if ok && mutating && ctx.dry_run && !ctx.json {
+        printer.info("");
+        printer.info(printer.dim(&format!("  Looks right? Run it for real: {}", real_run())));
     }
+    ok
+}
+
+/// Whether the command acts on the machine, so its dry run has a real run.
+fn changes_something(command: &Command) -> bool {
+    match command {
+        Command::Clean { .. }
+        | Command::Uninstall { .. }
+        | Command::Kill { .. }
+        | Command::Undo { .. }
+        | Command::Orphans { clean: true, .. }
+        | Command::Schedule { when: Some(_), .. }
+        | Command::Agents {
+            command:
+                AgentCommand::Disable { .. } | AgentCommand::Enable { .. } | AgentCommand::Remove { .. },
+        }
+        | Command::Files {
+            command: FileCommand::Clean { .. } | FileCommand::Downloads { clean: true, .. },
+        } => true,
+        Command::Sys { command } => !matches!(command, SysCommand::Updates),
+        _ => false,
+    }
+}
+
+/// The command line as typed, without the dry-run flag.
+fn real_run() -> String {
+    without_dry_run(std::env::args().skip(1))
+}
+
+fn without_dry_run(args: impl Iterator<Item = String>) -> String {
+    // ponytail: strips `n` from any bundle of short flags (`-yn`); a short
+    // option whose glued value holds an `n` (`-xfoo_n`) would be mangled too.
+    let args = args.filter_map(|arg| {
+        if arg == "-n" || arg == "--dry-run" {
+            return None;
+        }
+        if arg.starts_with('-')
+            && !arg.starts_with("--")
+            && arg[1..].chars().all(|c| c.is_ascii_alphabetic())
+        {
+            let kept: String = arg.chars().filter(|&c| c != 'n').collect();
+            return (kept != "-").then_some(kept);
+        }
+        Some(if arg.contains(' ') {
+            format!("'{arg}'")
+        } else {
+            arg
+        })
+    });
+    std::iter::once("detox".to_string())
+        .chain(args)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The context with the age floor the command line asked for, if any.
@@ -326,8 +385,8 @@ fn info(ctx: &Ctx) -> bool {
     p.info("");
     p.info(p.dim("  detox ram         see what is eating memory"));
     p.info(p.dim("  detox files dev   find build residue in your projects"));
-    p.info(p.dim("  detox scan all    measure everything"));
-    p.info(p.dim("  detox clean all   clean everything"));
+    p.info(p.dim("  detox scan all    measure every target"));
+    render_next_clean(p, &measures);
     true
 }
 
@@ -430,7 +489,49 @@ fn scan_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
             fsx::full_disk_access_hint()
         ));
     }
+    render_next_clean(p, &measures);
     true
+}
+
+/// Turns a scan into the command that acts on it, so nobody has to retype
+/// target names. Your own data is left out: that one has to be asked for.
+fn render_next_clean(p: &Printer, measures: &[clean::Measure]) {
+    let worth: Vec<&str> = measures
+        .iter()
+        .filter(|m| m.bytes > 0 && m.unavailable.is_none() && m.risk != clean::Risk::Data)
+        .map(|m| m.target.slug())
+        .collect();
+    let data: Vec<&str> = measures
+        .iter()
+        .filter(|m| m.bytes > 0 && m.risk == clean::Risk::Data)
+        .map(|m| m.target.slug())
+        .collect();
+
+    p.info("");
+    if worth.is_empty() && data.is_empty() {
+        p.info(p.dim("  Nothing worth cleaning here."));
+        return;
+    }
+    if !worth.is_empty() {
+        let command = format!("detox clean {}", worth.join(" "));
+        p.info(p.dim("  Next:"));
+        p.info(format!(
+            "  {}  {}",
+            p.accent(&format!("{command} -n")),
+            p.dim("preview, touches nothing")
+        ));
+        p.info(format!(
+            "  {}     {}",
+            p.accent(&command),
+            p.dim("to the trash, undoable with detox undo")
+        ));
+    }
+    if !data.is_empty() {
+        p.info(p.dim(&format!(
+            "  {} hold your own data — name them explicitly if you mean it",
+            data.join(", ")
+        )));
+    }
 }
 
 // ── clean ───────────────────────────────────────────────────────────────────
@@ -540,7 +641,7 @@ fn clean_targets(ctx: &Ctx, targets: Vec<Target>) -> bool {
         || !second_gate(ctx, &targets, disposal)
     {
         if !ctx.json {
-            ctx.printer.info("Cancelled.");
+            ctx.printer.cancelled();
         }
         return false;
     }
@@ -763,7 +864,11 @@ fn apps(ctx: &Ctx, top: usize, unused: Option<u64>) -> bool {
     if unused.is_some() && apps.is_empty() {
         p.item(p.dim("everything installed shows use more recently than that"));
     }
-    if unused.is_some() && !apps.is_empty() {
+    if unused.is_none() {
+        p.info("");
+        p.info(p.dim("  detox apps --unused 90   only those you have not opened in 90 days"));
+        p.info(p.dim("  detox uninstall <name>   removes one, leftovers included"));
+    } else if !apps.is_empty() {
         p.info("");
         p.info(p.dim("  detox uninstall <name>   removes one, leftovers included"));
     }
@@ -833,7 +938,18 @@ fn downloads(
             p.info(p.dim(&format!("  … and {} more", found.len() - shown.len())));
         }
         p.info("");
-        p.info(p.dim("  detox files downloads --clean   removes them"));
+        let mut command = "detox files downloads".to_string();
+        if older_than != 180 {
+            command.push_str(&format!(" -o {older_than}"));
+        }
+        if root != fsx::home_join("Downloads") {
+            command.push_str(&format!(" -p '{}'", root.display()));
+        }
+        if all_types {
+            command.push_str(" --all");
+        }
+        p.info(p.dim(&format!("  {command} --clean -n   preview the removal")));
+        p.info(p.dim(&format!("  {command} --clean      removes them")));
         return true;
     }
 
@@ -865,7 +981,7 @@ fn downloads(
         format::size(total)
     )) {
         if !ctx.json {
-            p.info("Cancelled.");
+            p.cancelled();
         }
         return false;
     }
@@ -876,7 +992,7 @@ fn downloads(
         )
     {
         if !ctx.json {
-            p.info("Cancelled.");
+            p.cancelled();
         }
         return false;
     }
@@ -961,7 +1077,7 @@ fn large_files(ctx: &Ctx, min: u64, top: usize, path: Option<PathBuf>, depth: us
         format::size(scan::total(&files))
     ));
     if files.is_empty() {
-        p.item(p.dim("no file is that big"));
+        p.item(p.dim("no file is that big — try --min 100M or a deeper --depth"));
         return true;
     }
     for file in shown {
@@ -970,6 +1086,10 @@ fn large_files(ctx: &Ctx, min: u64, top: usize, path: Option<PathBuf>, depth: us
     if shown.len() < files.len() {
         p.info(p.dim(&format!("  … and {} more", files.len() - shown.len())));
     }
+    p.info("");
+    p.info(p.dim("  --min 100M / --path <dir>   widen or narrow the search"));
+    p.info(p.dim("  detox files downloads       old installers and archives"));
+    p.info(p.dim("  detox files dev             build residue of your projects"));
     true
 }
 
@@ -1089,7 +1209,10 @@ fn dev_residue(
             )));
         }
         p.info("");
-        p.info(p.dim("  detox files clean   removes them (your next build rebuilds them)"));
+        p.info(p.dim(&format!(
+            "  detox files clean{}   removes them (your next build rebuilds them)",
+            filter.args()
+        )));
         return true;
     };
 
@@ -1128,7 +1251,7 @@ fn dev_residue(
     // Removing all or nothing was the only option before this.
     if !take_all && !keep_some(ctx, &mut residue) {
         if !ctx.json {
-            p.info("Cancelled.");
+            p.cancelled();
         }
         return false;
     }
@@ -1148,7 +1271,7 @@ fn dev_residue(
         format::size(total)
     )) {
         if !ctx.json {
-            p.info("Cancelled.");
+            p.cancelled();
         }
         return false;
     }
@@ -1160,7 +1283,7 @@ fn dev_residue(
         )
     {
         if !ctx.json {
-            p.info("Cancelled.");
+            p.cancelled();
         }
         return false;
     }
@@ -1446,7 +1569,7 @@ fn uninstall(ctx: &Ctx, query: &str) -> bool {
         format::size(total)
     )) {
         if !ctx.json {
-            p.info("Cancelled.");
+            p.cancelled();
         }
         return false;
     }
@@ -1462,7 +1585,7 @@ fn uninstall(ctx: &Ctx, query: &str) -> bool {
         "delete",
     ) {
         if !ctx.json {
-            p.info("Cancelled.");
+            p.cancelled();
         }
         return false;
     }
@@ -1621,7 +1744,10 @@ fn leftovers(ctx: &Ctx, remove: bool, only: &[String], top: usize) -> bool {
         p.info("");
         p.info(p.dim("  Only directories named after a bundle identifier are matched, so this"));
         p.info(p.dim("  list is short of what is really there — and never guesses."));
-        p.info(p.dim("  detox orphans --clean   removes them"));
+        p.info(p.dim(&format!(
+            "  detox orphans --clean{}   removes them",
+            only.iter().map(|id| format!(" {id}")).collect::<String>()
+        )));
         return true;
     }
 
@@ -1655,7 +1781,7 @@ fn leftovers(ctx: &Ctx, remove: bool, only: &[String], top: usize) -> bool {
         format::size(total)
     )) {
         if !ctx.json {
-            p.info("Cancelled.");
+            p.cancelled();
         }
         return false;
     }
@@ -1669,7 +1795,7 @@ fn leftovers(ctx: &Ctx, remove: bool, only: &[String], top: usize) -> bool {
     };
     if !ctx.confirm_final(warning, "delete") {
         if !ctx.json {
-            p.info("Cancelled.");
+            p.cancelled();
         }
         return false;
     }
@@ -1810,7 +1936,7 @@ fn undo_run(ctx: &Ctx, id: Option<&str>) -> bool {
 
     if !ctx.confirm(&format!("Put back {} item(s)?", run.moves.len())) {
         if !ctx.json {
-            p.info("Cancelled.");
+            p.cancelled();
         }
         return false;
     }
@@ -1844,6 +1970,7 @@ fn undo_run(ctx: &Ctx, id: Option<&str>) -> bool {
     for error in &result.errors {
         p.error(error);
     }
+    p.info(p.dim("  detox history   every run, and which can still be undone"));
     result.errors.is_empty()
 }
 
@@ -2216,7 +2343,7 @@ fn kill(ctx: &Ctx, query: &str, force: bool, allow_system: bool) -> bool {
         group.processes.len()
     )) {
         if !ctx.json {
-            p.info("Cancelled.");
+            p.cancelled();
         }
         return false;
     }
@@ -2305,6 +2432,12 @@ fn list_agents(ctx: &Ctx, third_party_only: bool, scope: Option<Scope>) -> bool 
     p.info(format!(
         "  {third_party} third-party agent(s), {apple} Apple"
     ));
+    if !third_party_only {
+        p.info(p.dim("  detox agents list --third-party   hide Apple's own"));
+    }
+    if third_party > 0 {
+        p.info(p.dim("  detox agents disable <LABEL>      stops one from starting (undo: enable)"));
+    }
     true
 }
 
@@ -2351,7 +2484,7 @@ fn act_on_agents(ctx: &Ctx, action: Action, selection: Selection) -> bool {
     };
     if !ctx.confirm(&format!("{verb} {} agent(s)?", selected.len())) {
         if !ctx.json {
-            ctx.printer.info("Cancelled.");
+            ctx.printer.cancelled();
         }
         return false;
     }
@@ -2386,7 +2519,7 @@ fn sys(ctx: &Ctx, command: SysCommand) -> bool {
 
     if needs_confirmation && !ctx.confirm(question) {
         if !ctx.json {
-            ctx.printer.info("Cancelled.");
+            ctx.printer.cancelled();
         }
         return false;
     }
@@ -2419,4 +2552,21 @@ fn render_outcomes(ctx: &Ctx, outcomes: &[Outcome]) -> bool {
         outcome.render(&ctx.printer);
     }
     !failed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::without_dry_run;
+
+    fn run(line: &str) -> String {
+        without_dry_run(line.split(' ').map(String::from))
+    }
+
+    #[test]
+    fn drops_only_the_dry_run_flag() {
+        assert_eq!(run("clean cache -n"), "detox clean cache");
+        assert_eq!(run("--dry-run orphans --clean"), "detox orphans --clean");
+        assert_eq!(run("clean logs -yn"), "detox clean logs -y");
+        assert_eq!(run("files dev -o 30"), "detox files dev -o 30");
+    }
 }

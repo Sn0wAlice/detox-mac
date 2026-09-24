@@ -18,7 +18,13 @@ use crate::ui::ColorChoice;
     about,
     long_about = None,
     propagate_version = true,
-    arg_required_else_help = true
+    arg_required_else_help = true,
+    after_help = "Typical session:\n  \
+        detox info              what the machine holds, what can be reclaimed\n  \
+        detox scan all          measure, delete nothing\n  \
+        detox clean <TARGET> -n preview a cleanup\n  \
+        detox clean <TARGET>    do it (to the trash)\n  \
+        detox undo              put it back"
 )]
 pub struct Cli {
     #[command(flatten)]
@@ -393,6 +399,27 @@ pub struct DevFilter {
     /// Restrict to some languages (rust, node, python…).
     #[arg(short, long, value_name = "LANGUAGE", num_args = 1..)]
     pub lang: Vec<String>,
+}
+
+impl DevFilter {
+    /// The options that differ from their default, ready to paste after a
+    /// command, so a hint acts on exactly what was just listed.
+    pub fn args(&self) -> String {
+        let mut out = String::new();
+        if self.older_than != 7 {
+            out.push_str(&format!(" -o {}", self.older_than));
+        }
+        if let Some(path) = &self.path {
+            out.push_str(&format!(" -p '{}'", path.display()));
+        }
+        if self.depth != 8 {
+            out.push_str(&format!(" -d {}", self.depth));
+        }
+        if !self.lang.is_empty() {
+            out.push_str(&format!(" -l {}", self.lang.join(" ")));
+        }
+        out
+    }
 }
 
 #[derive(Debug, Subcommand)]
