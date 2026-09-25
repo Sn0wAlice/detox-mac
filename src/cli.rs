@@ -365,15 +365,15 @@ pub enum FileCommand {
         top: usize,
     },
 
-    /// Delete the build residue of local projects.
+    /// Delete the build residue of local projects, through the language's
+    /// own tool (`cargo clean`, `swift package reset`…) when it has one.
     Clean {
         #[command(flatten)]
         filter: DevFilter,
 
-        /// Use the language's own tool when it exists (`cargo clean`,
-        /// `swift package clean`…) instead of removing the directory.
+        /// Remove the directories directly, skipping the language's tool.
         #[arg(long)]
-        native: bool,
+        raw: bool,
 
         /// Remove everything found without offering to keep any of it.
         #[arg(long)]

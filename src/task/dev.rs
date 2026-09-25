@@ -29,7 +29,8 @@ struct Rule {
     confirm: Option<&'static str>,
     /// The ecosystem's own clean command, run from the project root. `None`
     /// when the tool offers none: removing the directory is then the official
-    /// method (`npm ci` and `composer install` rebuild it).
+    /// method (`npm ci` and `composer install` rebuild it). `{artifact}` is
+    /// replaced by the directory name.
     clean_command: Option<&'static [&'static str]>,
 }
 
@@ -96,7 +97,7 @@ const RULES: &[Rule] = &[
         extensions: &[],
         artifacts: &[".build"],
         confirm: None,
-        clean_command: Some(&["swift", "package", "clean"]),
+        clean_command: Some(&["swift", "package", "reset"]),
     },
     Rule {
         language: "dotnet",
@@ -120,7 +121,7 @@ const RULES: &[Rule] = &[
         extensions: &[],
         artifacts: &["_build", "deps"],
         confirm: None,
-        clean_command: Some(&["mix", "clean"]),
+        clean_command: Some(&["mix", "clean", "--deps"]),
     },
     Rule {
         language: "dart",
@@ -153,7 +154,7 @@ const RULES: &[Rule] = &[
         extensions: &[],
         artifacts: &["build", "cmake-build-debug", "cmake-build-release"],
         confirm: Some("CMakeCache.txt"),
-        clean_command: None,
+        clean_command: Some(&["cmake", "--build", "{artifact}", "--target", "clean"]),
     },
 ];
 
@@ -378,7 +379,7 @@ fn rule_for(language: &str) -> Option<&'static Rule> {
 }
 
 /// Clean command available for this residue, when the tool is installed.
-fn toolchain_command(residue: &Residue) -> Option<&'static [&'static str]> {
+fn toolchain_command(residue: &Residue) -> Option<Vec<String>> {
     let command = rule_for(residue.language)?.clean_command?;
     let program = command.first()?;
 
@@ -392,7 +393,12 @@ fn toolchain_command(residue: &Residue) -> Option<&'static [&'static str]> {
         cmd::exists(program)
     };
 
-    available.then_some(command)
+    available.then(|| {
+        command
+            .iter()
+            .map(|arg| arg.replace("{artifact}", &residue.kind))
+            .collect()
+    })
 }
 
 /// Describes the command that would be used, for display.
@@ -431,11 +437,12 @@ pub fn remove_one(residue: &Residue, toolchain: bool, ctx: &Ctx) -> Removed {
             return report;
         }
 
-        if let Err(err) = cmd::run_in(&residue.project, command[0], &command[1..]) {
+        if let Err(err) = cmd::run_in(&residue.project, &command[0], &command[1..]) {
             report.command = Some(format!("{} — {err}", command.join(" ")));
             report.method = Method::ToolchainThenRemoved;
         } else if residue.path.exists() {
-            // `mix clean` and `dotnet clean` only empty part of the directory.
+            // `mix clean`, `dotnet clean` and CMake's `clean` target only
+            // empty part of the directory.
             report.method = Method::ToolchainThenRemoved;
         } else {
             return report;
@@ -541,11 +548,30 @@ mod tests {
             };
             assert!(command.len() >= 2, "{}: incomplete command", rule.language);
             assert!(
-                command.contains(&"clean"),
+                command.contains(&"clean") || command.contains(&"reset"),
                 "{}: the command does not clean",
                 rule.language
             );
         }
+    }
+
+    #[test]
+    fn cmake_cleans_the_build_directory_it_found() {
+        if !cmd::exists("cmake") {
+            return;
+        }
+        let residue = Residue {
+            language: "cmake",
+            path: PathBuf::from("/p/cmake-build-debug"),
+            project: PathBuf::from("/p"),
+            kind: "cmake-build-debug".to_string(),
+            bytes: 0,
+            age_days: 0,
+        };
+        assert_eq!(
+            planned_command(&residue).unwrap(),
+            "cmake --build cmake-build-debug --target clean"
+        );
     }
 
     #[test]

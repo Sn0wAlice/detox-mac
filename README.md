@@ -311,21 +311,21 @@ Build residue in ~ — untouched for 10 day(s) (58 directories, 106.40 GB)
 there, and a CMake `build` only when it actually contains a `CMakeCache.txt`. A
 lone `target` with no manifest is left alone.
 
-| Language | Marker | Directories | `--native` command |
+| Language | Marker | Directories | Clean command |
 |---|---|---|---|
 | `rust` | `Cargo.toml` | `target` | `cargo clean --offline` |
 | `node` | `package.json` | `node_modules`, `.next`, `.nuxt`, `.turbo`, `.parcel-cache`, `.svelte-kit`, `.angular`, `.astro` | — |
 | `python` | `pyproject.toml`, `setup.py`, `requirements.txt`, `Pipfile` | `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.tox` | — |
 | `gradle` | `build.gradle(.kts)`, `settings.gradle` | `build`, `.gradle` | `./gradlew clean --offline` |
 | `maven` | `pom.xml` | `target` | `mvn -o -q clean` |
-| `swift` | `Package.swift` | `.build` | `swift package clean` |
+| `swift` | `Package.swift` | `.build` | `swift package reset` |
 | `dotnet` | `*.csproj`, `*.fsproj`, `*.vbproj`, `*.sln` | `bin`, `obj` | `dotnet clean` |
 | `php` | `composer.json` | `vendor` | — |
-| `elixir` | `mix.exs` | `_build`, `deps` | `mix clean` |
+| `elixir` | `mix.exs` | `_build`, `deps` | `mix clean --deps` |
 | `dart` | `pubspec.yaml` | `build`, `.dart_tool` | `flutter clean` |
 | `zig` | `build.zig` | `zig-cache`, `.zig-cache`, `zig-out` | — |
 | `go` | `go.mod` | `vendor` | — |
-| `cmake` | `CMakeLists.txt` + `CMakeCache.txt` | `build`, `cmake-build-debug`, `cmake-build-release` | — |
+| `cmake` | `CMakeLists.txt` + `CMakeCache.txt` | `build`, `cmake-build-debug`, `cmake-build-release` | `cmake --build <dir> --target clean` |
 
 - **Age** is the time since the directory *or its top-level content* last
   changed: a `target` you compiled into this morning is never offered, however
@@ -337,15 +337,16 @@ lone `target` with no manifest is left alone.
 
 ### Removal, or the language's own tool?
 
-By default, `files clean` **removes the directory**. For `cargo` as for `npm`
-the result is identical: `cargo clean` wipes `target/` entirely, and `npm` has
-no clean command — removing `node_modules` *is* the official method, `npm ci`
-puts it back.
+By default, `files clean` **hands over to the language's tool** where one
+exists (`cargo clean`, `dotnet clean`…). Where there is none — `npm`,
+`composer`, `pip` — removing the directory *is* the official method: `npm ci`
+puts `node_modules` back.
 
-`--native` hands over to the language's tool where one exists:
+`--raw` skips the tools and removes the directories directly, which is faster
+(a `gradlew clean` boots a JVM):
 
 ```bash
-detox files clean --native --older-than 30
+detox files clean --raw --older-than 30
 ```
 
 - The tool is only used when it is **installed** (`gradlew` is looked up in the
@@ -353,10 +354,10 @@ detox files clean --native --older-than 30
   no failure and no question.
 - Commands run **offline** (`--offline`, `-o`) and non-interactively: a cleanup
   must never trigger a dependency download.
-- When the tool leaves things behind — `mix clean` does not touch `deps/`,
-  `dotnet clean` only removes what MSBuild tracked — the directory is removed
-  afterwards and the line says `then removed the leftovers`.
-- It is slower: a `gradlew clean` boots a JVM. Hence plain removal by default.
+- When the tool leaves things behind — `mix clean` keeps the `deps/` sources,
+  `dotnet clean` only removes what MSBuild tracked, CMake's `clean` keeps its
+  cache — the directory is removed afterwards and the line says
+  `then removed the leftovers`.
 
 ---
 

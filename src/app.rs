@@ -88,9 +88,9 @@ pub fn run(cli: Cli) -> bool {
             FileCommand::Dev { filter, top } => dev_residue(&ctx, &filter, top, None, false),
             FileCommand::Clean {
                 filter,
-                native,
+                raw,
                 all,
-            } => dev_residue(&ctx, &filter, 0, Some(native), all),
+            } => dev_residue(&ctx, &filter, 0, Some(!raw), all),
         },
         Command::Ram {
             top,
