@@ -1,0 +1,44 @@
+name: Build
+
+on:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.arch }}
+    runs-on: macos-latest
+    strategy:
+      matrix:
+        include:
+          - arch: apple-silicon
+            target: aarch64-apple-darwin
+          - arch: intel
+            target: x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --target ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          VERSION=$(cargo pkgid | sed 's/.*[#@]//')
+          NAME=detox-$VERSION-${{ matrix.target }}
+          tar -czf $NAME.tar.gz -C target/${{ matrix.target }}/release detox
+          shasum -a 256 $NAME.tar.gz > $NAME.tar.gz.sha256
+          echo "NAME=$NAME" >> $GITHUB_ENV
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}
+          path: ${{ env.NAME }}.tar.gz*
